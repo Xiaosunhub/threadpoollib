@@ -1,0 +1,13 @@
+threadpool provides CMake targets:
+
+    find_package(threadpool CONFIG REQUIRED)
+
+    target_link_libraries(
+        main
+        PRIVATE
+            threadpool::threadpool
+    )
+
+Usage:
+
+    #include <threadpool.hpp>
