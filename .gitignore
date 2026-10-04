@@ -2,3 +2,5 @@ build/
 dist/
 *.obj
 *.exe
+*.zip
+*.7z
