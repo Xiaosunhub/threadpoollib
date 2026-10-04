@@ -5,8 +5,8 @@ vcpkg_check_linkage(
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO Xiaosunhub/threadpoollib
-    REF v1.0.0
-    SHA512  bcef175994ca93ad962104d6431ec36f774b373d72fb773e66421c5205b76e448d6ef8a4e229e9add25b062bb5ae764b2099cafcbc31c46ad2cd77a837396e4b
+    REF v1.0.1
+    SHA512  77c02bf0dcaccf7a3163457f5ddc4170fd84f083dc1a98fe0f88f3120ed04386dd5025756ba2e592ed31a028834ce2e8688039bde37546caba6af99f4a9c1282
     HEAD_REF main
 )
 
@@ -18,6 +18,8 @@ vcpkg_cmake_configure(
 )
 
 vcpkg_cmake_install()
+
+file(INSTALL "${CMAKE_CURRENT_LIST_DIR}/usage" DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}")
 
 vcpkg_cmake_config_fixup(CONFIG_PATH lib/cmake/threadpool)
 
