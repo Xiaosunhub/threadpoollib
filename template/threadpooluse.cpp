@@ -1,7 +1,9 @@
 #include "threadpool.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,6 +24,28 @@ int main()
     cfg.idle_timeout = 2s;
 
     cfg.reject = RejectPolicy::BLOCK;
+
+
+    /*
+     * Optional hook: invoked once per worker thread.
+     */
+    std::atomic<int> workers_started{0};
+
+
+    cfg.thread_init =
+        [&workers_started]()
+        {
+            int index =
+                workers_started.fetch_add(
+                    1
+                ) + 1;
+
+
+            std::cout
+                << "[init] worker #"
+                << index
+                << " ready\n";
+        };
 
 
     ThreadPool pool(cfg);
@@ -210,6 +234,121 @@ int main()
 
 
     // ========================================================
+    // Move-only argument
+    //
+    // The callable and its arguments are forwarded, so std::unique_ptr
+    // works as an argument.
+    // ========================================================
+
+    auto move_only =
+        pool.submit(
+            [](std::unique_ptr<int> value)
+            {
+                return *value;
+            },
+            std::make_unique<int>(99)
+        );
+
+
+    std::cout
+        << "move-only arg = "
+        << move_only.get()
+        << '\n';
+
+
+    // ========================================================
+    // Pause / resume with non-throwing submission
+    //
+    // try_submit() never waits for a free slot and returns
+    // std::nullopt instead of throwing.
+    // ========================================================
+
+    pool.pause();
+
+
+    std::vector<
+        std::future<int>
+    > paused_batch;
+
+
+    std::size_t queued = 0;
+
+
+    for(int i = 0;
+        i < 40;
+        ++i)
+    {
+        auto maybe =
+            pool.try_submit(
+                [i]()
+                {
+                    return i;
+                }
+            );
+
+
+        if(!maybe)
+        {
+            std::cout
+                << "try_submit rejected at #"
+                << i
+                << '\n';
+
+            break;
+        }
+
+
+        paused_batch.emplace_back(
+            std::move(*maybe)
+        );
+
+
+        ++queued;
+    }
+
+
+    std::cout
+        << "queued while paused = "
+        << queued
+        << '\n';
+
+
+    pool.resume();
+
+
+    for(auto& f : paused_batch)
+    {
+        f.get();
+    }
+
+
+    /*
+     * wait() returns once the queue is empty and every task finished.
+     */
+    pool.wait();
+
+
+    {
+        auto m =
+            pool.get_metrics();
+
+
+        std::cout
+            << "\n=== after wait ===\n";
+
+        std::cout
+            << "active    : "
+            << m.active
+            << '\n';
+
+        std::cout
+            << "completed : "
+            << m.completed
+            << '\n';
+    }
+
+
+    // ========================================================
     // Submit many tasks to test dynamic expansion
     // ========================================================
 
@@ -331,6 +470,70 @@ int main()
             << m.idle_count
             << '\n';
     }
+
+
+    // ========================================================
+    // RejectPolicy::CALLER_RUNS
+    //
+    // A saturated pool executes the task in the submitting thread
+    // instead of blocking or discarding it.
+    // ========================================================
+
+    ThreadPool::Config caller_cfg;
+
+    caller_cfg.min_threads = 1;
+    caller_cfg.max_threads = 1;
+
+    caller_cfg.max_queue = 1;
+
+    caller_cfg.idle_timeout = 500ms;
+
+    caller_cfg.reject =
+        RejectPolicy::CALLER_RUNS;
+
+
+    ThreadPool caller_pool(caller_cfg);
+
+
+    std::vector<
+        std::future<std::thread::id>
+    > ids;
+
+
+    for(int i = 0; i < 6; ++i)
+    {
+        ids.emplace_back(
+            caller_pool.submit(
+                []()
+                {
+                    std::this_thread::sleep_for(
+                        150ms
+                    );
+
+                    return std::this_thread::get_id();
+                }
+            )
+        );
+    }
+
+
+    int caller_ran = 0;
+
+
+    for(auto& f : ids)
+    {
+        if(f.get()
+            == std::this_thread::get_id())
+        {
+            ++caller_ran;
+        }
+    }
+
+
+    std::cout
+        << "\ntasks executed in the caller thread = "
+        << caller_ran
+        << '\n';
 
 
     // ========================================================

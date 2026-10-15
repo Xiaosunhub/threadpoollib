@@ -1,7 +1,5 @@
 #include "threadpool.hpp"
 
-#include <algorithm>
-
 
 ThreadPool::ThreadPool(Config cfg)
     : cfg_(std::move(cfg))
@@ -67,12 +65,69 @@ ThreadPool::~ThreadPool()
      * The destructor must wait until every worker has completely exited.
      * Otherwise, a worker could access this object after destruction,
      * causing a use-after-free bug.
+     *
+     * The workers are moved out under the lock and joined without holding
+     * it: a worker still needs the mutex before it can finish its last
+     * iteration.
      */
-    for(auto& thread : threads_)
+    std::vector<
+        std::unique_ptr<Worker>
+    > pending;
+
+
     {
-        if(thread.joinable())
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        pending.swap(workers_);
+    }
+
+
+    for(auto& worker : pending)
+    {
+        if(worker->thread.joinable())
         {
-            thread.join();
+            worker->thread.join();
+        }
+    }
+}
+
+
+// ============================================================
+// reap_workers_locked
+// ============================================================
+
+void ThreadPool::reap_workers_locked()
+{
+    /*
+     * The caller must already hold mtx_.
+     *
+     * A Worker is removed only after the corresponding thread left
+     * worker_loop(). Without this step, exited std::thread objects would
+     * stay in workers_ forever and every expansion / shrink cycle would
+     * add one more dead entry.
+     *
+     * Joining here is safe because a finished worker no longer touches
+     * mtx_.
+     */
+    for(auto it = workers_.begin();
+        it != workers_.end();)
+    {
+        Worker& worker = **it;
+
+
+        if(worker.finished.load(
+            std::memory_order_acquire))
+        {
+            if(worker.thread.joinable())
+            {
+                worker.thread.join();
+            }
+
+            it = workers_.erase(it);
+        }
+        else
+        {
+            ++it;
         }
     }
 }
@@ -97,6 +152,25 @@ void ThreadPool::create_worker_locked()
 
 
     /*
+     * Reap exited workers first so that workers_ does not grow
+     * unboundedly.
+     */
+    reap_workers_locked();
+
+
+    /*
+     * The Worker object must exist before the thread starts: a running
+     * worker only owns a raw pointer to it.
+     */
+    workers_.push_back(
+        std::make_unique<Worker>()
+    );
+
+
+    Worker* worker = workers_.back().get();
+
+
+    /*
      * The order here is important:
      *
      * increment worker_count_ before starting the thread.
@@ -109,14 +183,19 @@ void ThreadPool::create_worker_locked()
 
     try
     {
-        threads_.emplace_back(
-            &ThreadPool::worker_loop,
-            this
-        );
+        worker->thread =
+            std::thread(
+                &ThreadPool::worker_loop,
+                this,
+                worker
+            );
     }
     catch(...)
     {
         --worker_count_;
+
+        workers_.pop_back();
+
         throw;
     }
 }
@@ -155,11 +234,241 @@ void ThreadPool::maybe_expand_locked()
 
 
 // ============================================================
+// pop_task_locked
+// ============================================================
+
+bool ThreadPool::pop_task_locked(Task& out)
+{
+    /*
+     * The caller must already hold mtx_.
+     */
+
+    if(tasks_.empty())
+        return false;
+
+
+    /*
+     * priority_queue exposes only a const reference to its top element.
+     *
+     * The element itself is not const, so moving it out through
+     * const_cast is well defined here.
+     */
+    out =
+        std::move(
+            const_cast<Task&>(
+                tasks_.top()
+            )
+        );
+
+
+    tasks_.pop();
+
+
+    /*
+     * One queue slot is now available.
+     * Wake one producer blocked in submit().
+     */
+    cv_queue_.notify_one();
+
+
+    return true;
+}
+
+
+// ============================================================
+// discard_tasks_locked
+// ============================================================
+
+void ThreadPool::discard_tasks_locked()
+{
+    /*
+     * The caller must already hold mtx_.
+     *
+     * Every queued task is marked CANCELLED.
+     *
+     * The associated std::packaged_task is destroyed without being
+     * executed, so the future reports broken_promise just like an
+     * explicitly cancelled task.
+     */
+    Task task;
+
+
+    while(pop_task_locked(task))
+    {
+        if(task.state)
+        {
+            TaskState expected =
+                TaskState::WAITING;
+
+
+            if(task.state
+                ->compare_exchange_strong(
+                    expected,
+                    TaskState::CANCELLED,
+                    std::memory_order_acq_rel
+                ))
+            {
+                cancelled_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
+            }
+        }
+
+
+        /*
+         * Release any resource captured by the task immediately.
+         */
+        task = Task{};
+    }
+}
+
+
+// ============================================================
+// enqueue_task
+// ============================================================
+
+ThreadPool::SubmitResult ThreadPool::enqueue_task(
+    Task& task,
+    bool allow_wait,
+    std::function<void()>& reject_cb
+)
+{
+    std::unique_lock<std::mutex> lock(mtx_);
+
+
+    if(stopping_)
+    {
+        rejected_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+
+        reject_cb = reject_callback_;
+
+
+        return SubmitResult::REJECTED_STOPPED;
+    }
+
+
+    /*
+     * Handle a full task queue.
+     */
+    if(tasks_.size() >= cfg_.max_queue)
+    {
+        if(cfg_.reject
+            == RejectPolicy::CALLER_RUNS)
+        {
+            /*
+             * The caller executes the task itself.
+             *
+             * Nothing is pushed here, so the caller must keep the Task
+             * object alive.
+             */
+            submitted_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+
+            return SubmitResult::CALLER_RUNS;
+        }
+
+
+        if(allow_wait
+            &&
+            cfg_.reject == RejectPolicy::BLOCK)
+        {
+            cv_queue_.wait(
+                lock,
+                [this]()
+                {
+                    return stopping_
+                        ||
+                        tasks_.size()
+                        < cfg_.max_queue;
+                }
+            );
+
+
+            if(stopping_)
+            {
+                rejected_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
+
+
+                reject_cb = reject_callback_;
+
+
+                return SubmitResult::REJECTED_STOPPED;
+            }
+        }
+        else
+        {
+            rejected_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+
+            reject_cb = reject_callback_;
+
+
+            return SubmitResult::REJECTED_FULL;
+        }
+    }
+
+
+    tasks_.push(
+        std::move(task)
+    );
+
+
+    submitted_.fetch_add(
+        1,
+        std::memory_order_relaxed
+    );
+
+
+    /*
+     * Dynamically expand the worker pool according to the current load.
+     */
+    maybe_expand_locked();
+
+
+    return SubmitResult::ACCEPTED;
+}
+
+
+// ============================================================
 // worker_loop
 // ============================================================
 
-void ThreadPool::worker_loop()
+void ThreadPool::worker_loop(Worker* self)
 {
+    /*
+     * Optional per-thread initialization hook.
+     *
+     * It runs without any internal lock held, exactly like a user task.
+     */
+    if(cfg_.thread_init)
+    {
+        try
+        {
+            cfg_.thread_init();
+        }
+        catch(...)
+        {
+            /*
+             * A failing hook must not kill the worker.
+             */
+        }
+    }
+
+
     for(;;)
     {
         Task task;
@@ -172,17 +481,43 @@ void ThreadPool::worker_loop()
             ++idle_count_;
 
 
-            bool awakened =
-                cv_task_.wait_for(
+            bool timed_out = false;
+
+
+            if(paused_)
+            {
+                /*
+                 * Wait without a timeout while paused.
+                 *
+                 * Treating a pause as an idle timeout would shrink the
+                 * pool even though the load did not change.
+                 */
+                cv_task_.wait(
                     lock,
-                    cfg_.idle_timeout,
                     [this]()
                     {
                         return stopping_
                             ||
-                            !tasks_.empty();
+                            !paused_;
                     }
                 );
+            }
+            else
+            {
+                timed_out =
+                    !cv_task_.wait_for(
+                        lock,
+                        cfg_.idle_timeout,
+                        [this]()
+                        {
+                            return stopping_
+                                ||
+                                (!paused_
+                                    &&
+                                    !tasks_.empty());
+                        }
+                    );
+            }
 
 
             --idle_count_;
@@ -191,7 +526,7 @@ void ThreadPool::worker_loop()
             /*
              * Handle idle timeout.
              */
-            if(!awakened)
+            if(timed_out)
             {
                 /*
                  * Dynamically shrink the pool.
@@ -203,7 +538,7 @@ void ThreadPool::worker_loop()
                 {
                     --worker_count_;
 
-                    return;
+                    break;
                 }
 
 
@@ -224,7 +559,7 @@ void ThreadPool::worker_loop()
             {
                 --worker_count_;
 
-                return;
+                break;
             }
 
 
@@ -239,8 +574,16 @@ void ThreadPool::worker_loop()
             {
                 --worker_count_;
 
-                return;
+                break;
             }
+
+
+            /*
+             * Resumed from a pause: re-evaluate the whole state instead of
+             * assuming the queue has work for this worker.
+             */
+            if(paused_)
+                continue;
 
 
             /*
@@ -249,28 +592,17 @@ void ThreadPool::worker_loop()
              *
              * Keep this check for defensive robustness.
              */
-            if(tasks_.empty())
-            {
+            if(!pop_task_locked(task))
                 continue;
-            }
-
-
-            task =
-                std::move(
-                    const_cast<Task&>(
-                        tasks_.top()
-                    )
-                );
-
-
-            tasks_.pop();
 
 
             /*
-             * One queue slot is now available.
-             * Wake one producer blocked in submit().
+             * Count the task as active before releasing the lock.
+             *
+             * Otherwise wait() could return while this task has been taken
+             * from the queue but has not started running yet.
              */
-            cv_queue_.notify_one();
+            ++inflight_;
         }
 
 
@@ -292,7 +624,131 @@ void ThreadPool::worker_loop()
              * A single task must not terminate the worker thread.
              */
         }
+
+
+        /*
+         * Drop the user callable before locking again:
+         *
+         * destructors of captured objects must not run under the mutex.
+         */
+        task = Task{};
+
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+
+            --inflight_;
+
+
+            if(inflight_ == 0
+                &&
+                tasks_.empty())
+            {
+                /*
+                 * Wake every thread waiting in wait() / wait_for().
+                 */
+                cv_idle_.notify_all();
+            }
+        }
     }
+
+
+    /*
+     * The worker must not lock mtx_ at this point.
+     *
+     * reap_workers_locked() joins finished workers while holding it, so
+     * taking the mutex here would deadlock against the reaper.
+     */
+    self->finished.store(
+        true,
+        std::memory_order_release
+    );
+}
+
+
+// ============================================================
+// wait
+// ============================================================
+
+void ThreadPool::wait()
+{
+    std::unique_lock<std::mutex> lock(mtx_);
+
+
+    cv_idle_.wait(
+        lock,
+        [this]()
+        {
+            return tasks_.empty()
+                &&
+                inflight_ == 0;
+        }
+    );
+}
+
+
+// ============================================================
+// pause / resume
+// ============================================================
+
+void ThreadPool::pause()
+{
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        paused_ = true;
+    }
+
+
+    cv_task_.notify_all();
+}
+
+
+void ThreadPool::resume()
+{
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        paused_ = false;
+    }
+
+
+    cv_task_.notify_all();
+}
+
+
+bool ThreadPool::is_paused() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    return paused_;
+}
+
+
+// ============================================================
+// clear
+// ============================================================
+
+void ThreadPool::clear()
+{
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        discard_tasks_locked();
+    }
+
+
+    /*
+     * A popped task may have released queue slots.
+     */
+    cv_queue_.notify_all();
+
+
+    /*
+     * The queue is empty now: wake threads waiting on drain.
+     */
+    cv_idle_.notify_all();
 }
 
 
@@ -323,45 +779,22 @@ void ThreadPool::stop(
                     PoolStopMode::IMMEDIATE;
 
 
-                while(!tasks_.empty())
-                {
-                    Task task =
-                        std::move(
-                            const_cast<Task&>(
-                                tasks_.top()
-                            )
-                        );
-
-
-                    tasks_.pop();
-
-
-                    if(task.state)
-                    {
-                        TaskState expected =
-                            TaskState::WAITING;
-
-
-                        if(task.state
-                            ->compare_exchange_strong(
-                                expected,
-                                TaskState::CANCELLED,
-                                std::memory_order_acq_rel
-                            ))
-                        {
-                            cancelled_.fetch_add(
-                                1,
-                                std::memory_order_relaxed
-                            );
-                        }
-                    }
-                }
+                discard_tasks_locked();
             }
+
+
+            /*
+             * Leaving the pool paused would prevent the workers that are
+             * still executing tasks from draining the queue.
+             */
+            paused_ = false;
 
 
             cv_task_.notify_all();
 
             cv_queue_.notify_all();
+
+            cv_idle_.notify_all();
 
             return;
         }
@@ -371,45 +804,15 @@ void ThreadPool::stop(
 
         stop_mode_ = mode;
 
+        paused_ = false;
+
 
         if(mode == PoolStopMode::IMMEDIATE)
         {
             /*
              * Discard all tasks that have not started yet.
              */
-            while(!tasks_.empty())
-            {
-                Task task =
-                    std::move(
-                        const_cast<Task&>(
-                            tasks_.top()
-                        )
-                    );
-
-
-                tasks_.pop();
-
-
-                if(task.state)
-                {
-                    TaskState expected =
-                        TaskState::WAITING;
-
-
-                    if(task.state
-                        ->compare_exchange_strong(
-                            expected,
-                            TaskState::CANCELLED,
-                            std::memory_order_acq_rel
-                        ))
-                    {
-                        cancelled_.fetch_add(
-                            1,
-                            std::memory_order_relaxed
-                        );
-                    }
-                }
-            }
+            discard_tasks_locked();
         }
     }
 
@@ -424,6 +827,13 @@ void ThreadPool::stop(
      * Wake all producers that may be blocked in submit().
      */
     cv_queue_.notify_all();
+
+
+    /*
+     * The pool can no longer accept work, so drain waiters are released as
+     * soon as the running tasks finish.
+     */
+    cv_idle_.notify_all();
 }
 
 
@@ -462,6 +872,15 @@ PoolMetrics ThreadPool::get_metrics() const
 
         metrics.queue_size =
             tasks_.size();
+
+        metrics.min_threads =
+            cfg_.min_threads;
+
+        metrics.max_threads =
+            cfg_.max_threads;
+
+        metrics.active =
+            inflight_ + tasks_.size();
     }
 
 
@@ -492,6 +911,18 @@ PoolMetrics ThreadPool::get_metrics() const
 
 
     return metrics;
+}
+
+
+// ============================================================
+// get_config
+// ============================================================
+
+ThreadPool::Config ThreadPool::get_config() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    return cfg_;
 }
 
 

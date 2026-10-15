@@ -9,9 +9,11 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -27,7 +29,15 @@ enum class PoolStopMode
 enum class RejectPolicy
 {
     BLOCK,      // Block submit() when the queue is full
-    DISCARD     // Reject the task immediately when the queue is full
+    DISCARD,    // Reject the task immediately when the queue is full
+
+    /*
+     * Execute the rejected task directly in the submitting thread.
+     *
+     * This keeps latency bounded for the producer and guarantees the task
+     * eventually runs, but it makes the caller block for the whole task.
+     */
+    CALLER_RUNS
 };
 
 
@@ -74,6 +84,11 @@ public:
         return state_->load(std::memory_order_acquire);
     }
 
+    bool valid() const
+    {
+        return static_cast<bool>(state_);
+    }
+
 private:
     explicit TaskHandle(
         std::shared_ptr<std::atomic<TaskState>> state)
@@ -105,6 +120,15 @@ struct PoolMetrics
     std::size_t idle_count = 0;
     std::size_t queue_size = 0;
 
+    std::size_t min_threads = 0;
+    std::size_t max_threads = 0;
+
+    /*
+     * active = queue_size + tasks already picked up by a worker but not
+     * finished yet.
+     */
+    std::size_t active = 0;
+
     std::uint64_t submitted = 0;
     std::uint64_t completed = 0;
     std::uint64_t cancelled = 0;
@@ -127,6 +151,20 @@ public:
         std::chrono::milliseconds idle_timeout{2000};
 
         RejectPolicy reject = RejectPolicy::BLOCK;
+
+        /*
+         * Optional hook executed once at the beginning of every worker
+         * thread, outside of any internal lock.
+         *
+         * Typical uses:
+         *
+         * - set a thread name for debugging
+         * - initialize thread-local resources
+         *
+         * Exceptions thrown by the hook are swallowed so that the pool
+         * keeps working with a partially initialized worker.
+         */
+        std::function<void()> thread_init;
     };
 
 
@@ -137,10 +175,28 @@ public:
     ~ThreadPool();
 
 
+    /*
+     * A ThreadPool owns threads and tasks.
+     *
+     * Copying it would duplicate every member including running threads,
+     * so copying and moving are disabled.
+     */
+    ThreadPool(const ThreadPool&) = delete;
+
+    ThreadPool& operator=(const ThreadPool&) = delete;
+
+    ThreadPool(ThreadPool&&) = delete;
+
+    ThreadPool& operator=(ThreadPool&&) = delete;
+
+
     /**
      * Submit a normal task.
      *
      * Default priority = 0.
+     *
+     * Throws std::runtime_error if the pool is stopped or if the task is
+     * rejected.
      */
     template <class F, class... Args>
     auto submit(F&& f, Args&&... args)
@@ -179,6 +235,97 @@ public:
         >;
 
 
+    /**
+     * Non-throwing submission.
+     *
+     * Unlike submit(), these never wait for a free queue slot and never
+     * throw when the task cannot be accepted.
+     *
+     * std::nullopt means the queue is full or the pool is stopped.
+     */
+    template <class F, class... Args>
+    auto try_submit(F&& f, Args&&... args)
+        -> std::optional<
+            std::future<
+                std::invoke_result_t<F, Args...>
+            >
+        >;
+
+
+    template <class F, class... Args>
+    auto try_submit_priority(
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> std::optional<
+            std::future<
+                std::invoke_result_t<F, Args...>
+            >
+        >;
+
+
+    template <class F, class... Args>
+    auto try_submit_cancellable(
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> std::optional<
+            TaskResult<
+                std::invoke_result_t<F, Args...>
+            >
+        >;
+
+
+    /**
+     * Wait until the queue is empty and every task has finished.
+     *
+     * NOTE:
+     * Never call wait() / wait_for() from inside a task of the same pool.
+     * The waiting count includes the caller's own task, so the wait could
+     * never complete.
+     */
+    void wait();
+
+
+    /**
+     * Wait with a timeout.
+     *
+     * Returns true if the pool drained, false on timeout.
+     */
+    template <class Rep, class Period>
+    bool wait_for(
+        const std::chrono::duration<
+            Rep,
+            Period
+        >& timeout
+    );
+
+
+    /**
+     * Suspend task execution.
+     *
+     * Already running tasks are not interrupted, but no queued task is
+     * picked up until resume() is called.
+     */
+    void pause();
+
+
+    void resume();
+
+
+    bool is_paused() const;
+
+
+    /**
+     * Drop every queued task that has not started yet.
+     *
+     * The associated TaskHandles are marked CANCELLED.
+     */
+    void clear();
+
+
     void set_reject_callback(std::function<void()> cb);
 
 
@@ -188,6 +335,9 @@ public:
 
 
     PoolMetrics get_metrics() const;
+
+
+    Config get_config() const;
 
 
     bool is_stopped() const;
@@ -232,13 +382,84 @@ private:
     };
 
 
+    /*
+     * Result of an enqueue attempt.
+     */
+    enum class SubmitResult
+    {
+        ACCEPTED,
+        REJECTED_FULL,
+        REJECTED_STOPPED,
+        CALLER_RUNS
+    };
+
+
+    using TaskQueue =
+        std::priority_queue<
+            Task,
+            std::vector<Task>,
+            TaskCompare
+        >;
+
+
+    /*
+     * Worker bookkeeping.
+     *
+     * finished is set by the worker itself after it left worker_loop().
+     * The pool uses it to reap exited std::thread objects instead of
+     * letting them accumulate forever.
+     */
+    struct Worker
+    {
+        std::thread thread;
+
+        std::atomic<bool> finished{false};
+    };
+
+
 private:
 
-    void worker_loop();
+    /**
+     * Common implementation shared by the throwing and non-throwing
+     * submission APIs.
+     *
+     * allow_wait:
+     *   permits blocking on a full queue when the policy is BLOCK.
+     *
+     * A status other than ACCEPTED / CALLER_RUNS hands the reject callback
+     * back through reject_cb so it can run outside of the lock.
+     */
+    SubmitResult enqueue_task(
+        Task& task,
+        bool allow_wait,
+        std::function<void()>& reject_cb
+    );
+
+
+    template <class F, class... Args>
+    auto do_submit(
+        int priority,
+        bool allow_wait,
+        SubmitResult& status,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    bool pop_task_locked(Task& out);
+
+    void discard_tasks_locked();
+
+    void worker_loop(Worker* self);
 
     void create_worker_locked();
 
     void maybe_expand_locked();
+
+    void reap_workers_locked();
 
 
 private:
@@ -246,19 +467,18 @@ private:
     Config cfg_;
 
 
-    std::priority_queue<
-        Task,
-        std::vector<Task>,
-        TaskCompare
-    > tasks_;
+    TaskQueue tasks_;
 
 
     /*
-     * Exited std::thread objects cannot simply be removed before join().
+     * Each entry is heap allocated so that Worker is never reallocated:
+     * a running worker hands its own address to the thread entry point.
      *
-     * worker_count_ represents the number of currently active workers.
+     * Entries are removed by reap_workers_locked() once a worker exited.
      */
-    std::vector<std::thread> threads_;
+    std::vector<
+        std::unique_ptr<Worker>
+    > workers_;
 
 
     mutable std::mutex mtx_;
@@ -267,8 +487,12 @@ private:
 
     std::condition_variable cv_queue_;
 
+    std::condition_variable cv_idle_;
+
 
     bool stopping_ = false;
+
+    bool paused_ = false;
 
     PoolStopMode stop_mode_ =
         PoolStopMode::GRACEFUL;
@@ -277,6 +501,15 @@ private:
     std::size_t worker_count_ = 0;
 
     std::size_t idle_count_ = 0;
+
+
+    /*
+     * Number of tasks already taken out of the queue but not finished.
+     *
+     * Without it, wait() could return right after a worker popped the last
+     * task but before that task actually ran.
+     */
+    std::size_t inflight_ = 0;
 
 
     std::function<void()> reject_callback_;
@@ -355,25 +588,230 @@ auto ThreadPool::submit_cancellable(
         std::invoke_result_t<F, Args...>
     >
 {
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_submit(
+        priority,
+        true,
+        status,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status == SubmitResult::REJECTED_STOPPED)
+    {
+        throw std::runtime_error(
+            "ThreadPool already stopped"
+        );
+    }
+
+
+    if(status == SubmitResult::REJECTED_FULL)
+    {
+        throw std::runtime_error(
+            "ThreadPool queue full, task rejected"
+        );
+    }
+
+
+    return result;
+}
+
+
+// ============================================================
+// try_submit
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::try_submit(
+    F&& f,
+    Args&&... args
+)
+    -> std::optional<
+        std::future<
+            std::invoke_result_t<F, Args...>
+        >
+    >
+{
+    return try_submit_priority(
+        0,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+// ============================================================
+// try_submit_priority
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::try_submit_priority(
+    int priority,
+    F&& f,
+    Args&&... args
+)
+    -> std::optional<
+        std::future<
+            std::invoke_result_t<F, Args...>
+        >
+    >
+{
+    auto result = try_submit_cancellable(
+        priority,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(!result)
+        return std::nullopt;
+
+
+    return std::move(result->future);
+}
+
+
+// ============================================================
+// try_submit_cancellable
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::try_submit_cancellable(
+    int priority,
+    F&& f,
+    Args&&... args
+)
+    -> std::optional<
+        TaskResult<
+            std::invoke_result_t<F, Args...>
+        >
+    >
+{
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_submit(
+        priority,
+        false,
+        status,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status != SubmitResult::ACCEPTED
+        &&
+        status != SubmitResult::CALLER_RUNS)
+    {
+        return std::nullopt;
+    }
+
+
+    return result;
+}
+
+
+// ============================================================
+// wait_for
+// ============================================================
+
+template <class Rep, class Period>
+bool ThreadPool::wait_for(
+    const std::chrono::duration<
+        Rep,
+        Period
+    >& timeout
+)
+{
+    std::unique_lock<std::mutex> lock(mtx_);
+
+
+    return cv_idle_.wait_for(
+        lock,
+        timeout,
+        [this]()
+        {
+            return tasks_.empty()
+                &&
+                inflight_ == 0;
+        }
+    );
+}
+
+
+// ============================================================
+// do_submit
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::do_submit(
+    int priority,
+    bool allow_wait,
+    SubmitResult& status,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
     using ReturnType =
         std::invoke_result_t<F, Args...>;
+
+    using Callable =
+        std::decay_t<F>;
+
+    using ArgsTuple =
+        std::tuple<std::decay_t<Args>...>;
 
 
     /*
      * Bind the callable and its arguments into a zero-argument function.
+     *
+     * A lambda + tuple is used instead of std::bind because std::bind
+     * always decays and copies its arguments. That would reject move-only
+     * arguments and introduce unnecessary copies.
+     *
+     * std::apply invokes through std::invoke, so member function pointers
+     * are supported as well.
      */
-    auto bound =
-        std::bind(
-            std::forward<F>(f),
-            std::forward<Args>(args)...
-        );
-
-
     auto packaged =
         std::make_shared<
             std::packaged_task<ReturnType()>
         >(
-            std::move(bound)
+            [
+                callable =
+                    Callable(
+                        std::forward<F>(f)
+                    ),
+                bound =
+                    ArgsTuple(
+                        std::forward<Args>(args)...
+                    )
+            ]() mutable -> ReturnType
+            {
+                if constexpr(
+                    std::is_void_v<ReturnType>
+                )
+                {
+                    std::apply(
+                        std::move(callable),
+                        std::move(bound)
+                    );
+                }
+                else
+                {
+                    return std::apply(
+                        std::move(callable),
+                        std::move(bound)
+                    );
+                }
+            }
         );
 
 
@@ -483,111 +921,61 @@ auto ThreadPool::submit_cancellable(
     std::function<void()> reject_callback;
 
 
+    SubmitResult result =
+        enqueue_task(
+            task,
+            allow_wait,
+            reject_callback
+        );
+
+
+    if(result == SubmitResult::ACCEPTED)
     {
-        std::unique_lock<std::mutex> lock(mtx_);
-
-
-        if(stopping_)
-        {
-            rejected_.fetch_add(
-                1,
-                std::memory_order_relaxed
-            );
-
-            throw std::runtime_error(
-                "ThreadPool already stopped"
-            );
-        }
-
-
+        cv_task_.notify_one();
+    }
+    else if(result == SubmitResult::CALLER_RUNS)
+    {
         /*
-         * Handle a full task queue.
+         * The queue is full and the policy asks for caller runs.
+         *
+         * Execute the task here, outside of any lock, so that a blocked
+         * producer still makes progress.
          */
-        if(tasks_.size() >= cfg_.max_queue)
+        try
         {
-            if(cfg_.reject == RejectPolicy::BLOCK)
+            task.func();
+        }
+        catch(...)
+        {
+            /*
+             * Never propagate a task failure into the submitting thread.
+             */
+        }
+    }
+    else
+    {
+        /*
+         * Rejected: inform the caller through the reject callback.
+         * It runs outside of the internal lock.
+         */
+        if(reject_callback)
+        {
+            try
             {
-                cv_queue_.wait(
-                    lock,
-                    [this]()
-                    {
-                        return stopping_
-                            ||
-                            tasks_.size()
-                            < cfg_.max_queue;
-                    }
-                );
-
-
-                if(stopping_)
-                {
-                    rejected_.fetch_add(
-                        1,
-                        std::memory_order_relaxed
-                    );
-
-                    throw std::runtime_error(
-                        "ThreadPool stopped while submit was waiting"
-                    );
-                }
+                reject_callback();
             }
-            else
+            catch(...)
             {
-                rejected_.fetch_add(
-                    1,
-                    std::memory_order_relaxed
-                );
-
-
-                reject_callback =
-                    reject_callback_;
-
-
-                lock.unlock();
-
-
-                if(reject_callback)
-                {
-                    try
-                    {
-                        reject_callback();
-                    }
-                    catch(...)
-                    {
-                        /*
-                         * An exception from the rejection callback must not
-                         * affect the thread pool.
-                         */
-                    }
-                }
-
-
-                throw std::runtime_error(
-                    "ThreadPool queue full, task rejected"
-                );
+                /*
+                 * An exception from the rejection callback must not
+                 * affect the thread pool.
+                 */
             }
         }
-
-
-        tasks_.push(
-            std::move(task)
-        );
-
-
-        submitted_.fetch_add(
-            1,
-            std::memory_order_relaxed
-        );
-
-
-        /*
-         * Dynamically expand the worker pool according to the current load.
-         */
-        maybe_expand_locked();
     }
 
 
-    cv_task_.notify_one();
+    status = result;
 
 
     return TaskResult<ReturnType>{
