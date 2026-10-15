@@ -1,5 +1,6 @@
 build/
 dist/
+*.workbuddy/
 *.obj
 *.exe
 *.zip
