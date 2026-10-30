@@ -124,6 +124,8 @@ void ThreadPool::reap_workers_locked()
             }
 
             it = workers_.erase(it);
+
+            --exited_pending_;
         }
         else
         {
@@ -152,15 +154,8 @@ void ThreadPool::create_worker_locked()
 
 
     /*
-     * Reap exited workers first so that workers_ does not grow
-     * unboundedly.
-     */
-    reap_workers_locked();
-
-
-    /*
-     * The Worker object must exist before the thread starts: a running
-     * worker only owns a raw pointer to it.
+     * reap_workers_locked() is driven by maybe_expand_locked() so that a
+     * submit pays for it only when a worker actually exited.
      */
     workers_.push_back(
         std::make_unique<Worker>()
@@ -180,6 +175,8 @@ void ThreadPool::create_worker_locked()
      */
     ++worker_count_;
 
+    ++workers_created_;
+
 
     try
     {
@@ -194,10 +191,58 @@ void ThreadPool::create_worker_locked()
     {
         --worker_count_;
 
+        --workers_created_;
+
         workers_.pop_back();
 
         throw;
     }
+}
+
+
+// ============================================================
+// run_dropped
+// ============================================================
+
+void ThreadPool::run_dropped(
+    std::vector<Task>& dropped
+)
+{
+    /*
+     * Runs outside of mtx_.
+     *
+     * The wrapper detects that the state is no longer WAITING, counts the
+     * cancellation and breaks the promise, which would otherwise wait
+     * forever.
+     */
+    for(auto& task : dropped)
+    {
+        run_task(task);
+    }
+
+
+    dropped.clear();
+}
+
+
+// ============================================================
+// mark_exit_locked
+// ============================================================
+
+void ThreadPool::mark_exit_locked()
+{
+    /*
+     * The caller must already hold mtx_.
+     *
+     * worker_count_ describes the workers that are still able to run
+     * tasks, so it drops immediately.
+     *
+     * exited_pending_ keeps the difference to workers_ visible, which
+     * tells maybe_expand_locked() that there is a thread to join.
+     */
+    --worker_count_;
+
+    ++exited_pending_;
 }
 
 
@@ -216,6 +261,16 @@ void ThreadPool::maybe_expand_locked()
      * 2. The number of queued tasks exceeds the number of idle workers.
      * 3. The pool has not reached max_threads.
      */
+
+    /*
+     * Reclaim exited workers first.
+     *
+     * Doing this before the max_threads check is what keeps workers_ from
+     * filling up with dead entries when the pool never grows again.
+     */
+    if(exited_pending_ > 0)
+        reap_workers_locked();
+
 
     if(worker_count_ >= cfg_.max_threads)
         return;
@@ -279,17 +334,24 @@ bool ThreadPool::pop_task_locked(Task& out)
 // discard_tasks_locked
 // ============================================================
 
-void ThreadPool::discard_tasks_locked()
+std::size_t ThreadPool::discard_tasks_locked(
+    std::vector<Task>& dropped
+)
 {
     /*
      * The caller must already hold mtx_.
      *
-     * Every queued task is marked CANCELLED.
+     * Every queued task is marked CANCELLED so that no worker can start
+     * running it later.
      *
-     * The associated std::packaged_task is destroyed without being
-     * executed, so the future reports broken_promise just like an
-     * explicitly cancelled task.
+     * The tasks themselves go back to the caller, which has to pass them
+     * to run_task() once the lock is released: that is what breaks their
+     * promises and counts them as cancelled. Doing it under the lock would
+     * run user-side destructors while holding mtx_.
      */
+    dropped.clear();
+
+
     Task task;
 
 
@@ -301,26 +363,24 @@ void ThreadPool::discard_tasks_locked()
                 TaskState::WAITING;
 
 
-            if(task.state
-                ->compare_exchange_strong(
-                    expected,
-                    TaskState::CANCELLED,
-                    std::memory_order_acq_rel
-                ))
-            {
-                cancelled_.fetch_add(
-                    1,
-                    std::memory_order_relaxed
-                );
-            }
+            task.state->compare_exchange_strong(
+                expected,
+                TaskState::CANCELLED,
+                std::memory_order_acq_rel
+            );
         }
 
 
-        /*
-         * Release any resource captured by the task immediately.
-         */
+        dropped.emplace_back(
+            std::move(task)
+        );
+
+
         task = Task{};
     }
+
+
+    return dropped.size();
 }
 
 
@@ -433,10 +493,30 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
     );
 
 
+    if(tasks_.size() > peak_queue_)
+    {
+        peak_queue_ =
+            tasks_.size();
+    }
+
+
     /*
      * Dynamically expand the worker pool according to the current load.
      */
     maybe_expand_locked();
+
+
+    /*
+     * Wake one worker, but only if one is actually waiting.
+     *
+     * When every worker is busy executing a task, it revisits the queue as
+     * soon as it finishes, so a notify would be a pointless syscall -
+     * several hundred thousand of them per second under load.
+     */
+    if(idle_count_ > 0)
+    {
+        cv_task_.notify_one();
+    }
 
 
     return SubmitResult::ACCEPTED;
@@ -467,6 +547,12 @@ void ThreadPool::worker_loop(Worker* self)
              */
         }
     }
+
+
+    /*
+     * Reused between iterations so that batched pops rarely allocate.
+     */
+    std::vector<Task> batch;
 
 
     for(;;)
@@ -536,7 +622,7 @@ void ThreadPool::worker_loop(Worker* self)
                 if(worker_count_ >
                     cfg_.min_threads)
                 {
-                    --worker_count_;
+                    mark_exit_locked();
 
                     break;
                 }
@@ -557,7 +643,7 @@ void ThreadPool::worker_loop(Worker* self)
                 stop_mode_
                     == PoolStopMode::IMMEDIATE)
             {
-                --worker_count_;
+                mark_exit_locked();
 
                 break;
             }
@@ -572,7 +658,7 @@ void ThreadPool::worker_loop(Worker* self)
                 &&
                 tasks_.empty())
             {
-                --worker_count_;
+                mark_exit_locked();
 
                 break;
             }
@@ -597,48 +683,84 @@ void ThreadPool::worker_loop(Worker* self)
 
 
             /*
-             * Count the task as active before releasing the lock.
+             * Take a few extra tasks while the lock is held.
              *
-             * Otherwise wait() could return while this task has been taken
+             * One critical section serving several tiny tasks costs far
+             * less than one acquisition per task.
+             *
+             * batch_size > 1 does not change ordering guarantees seen by
+             * the callers: the tasks are still executed one after another.
+             */
+            batch.clear();
+
+
+            const std::size_t limit =
+                cfg_.batch_size > 0
+                    ? cfg_.batch_size
+                    : 1;
+
+
+            for(std::size_t i = 1;
+                i < limit;
+                ++i)
+            {
+                Task extra;
+
+
+                if(!pop_task_locked(extra))
+                    break;
+
+
+                batch.emplace_back(
+                    std::move(extra)
+                );
+            }
+
+
+            /*
+             * Count every taken task as active before releasing the lock.
+             *
+             * Otherwise wait() could return while a task has been taken
              * from the queue but has not started running yet.
              */
-            ++inflight_;
+            inflight_ +=
+                1 + batch.size();
         }
 
 
         /*
-         * Execute the task outside the mutex.
+         * Execute the tasks outside the mutex.
          *
          * This is important.
          *
          * Holding the mutex while executing a user task would block
          * submit(), get_metrics(), stop(), and other workers.
          */
-        try
+        run_task(task);
+
+
+        for(auto& extra : batch)
         {
-            task.func();
+            run_task(extra);
         }
-        catch(...)
+
+
         {
+            const std::size_t finished =
+                1 + batch.size();
+
+
             /*
-             * A single task must not terminate the worker thread.
+             * Clear before locking: destructors of captured objects must
+             * not run under the mutex.
              */
-        }
+            batch.clear();
 
 
-        /*
-         * Drop the user callable before locking again:
-         *
-         * destructors of captured objects must not run under the mutex.
-         */
-        task = Task{};
-
-
-        {
             std::lock_guard<std::mutex> lock(mtx_);
 
 
-            --inflight_;
+            inflight_ -= finished;
 
 
             if(inflight_ == 0
@@ -664,6 +786,39 @@ void ThreadPool::worker_loop(Worker* self)
         true,
         std::memory_order_release
     );
+}
+
+
+// ============================================================
+// run_task
+// ============================================================
+
+void ThreadPool::run_task(Task& task)
+{
+    /*
+     * Runs outside of mtx_.
+     *
+     * All bookkeeping lives inside the wrapper lambda created by
+     * do_submit(), so this only has to make sure that neither an escaping
+     * exception nor a captured destructor can kill the caller.
+     */
+    try
+    {
+        task.func();
+    }
+    catch(...)
+    {
+        /*
+         * A single task must not terminate the worker thread or the
+         * submitting thread.
+         */
+    }
+
+
+    /*
+     * Drop the user callable before the caller locks again.
+     */
+    task = Task{};
 }
 
 
@@ -730,13 +885,26 @@ bool ThreadPool::is_paused() const
 // clear
 // ============================================================
 
-void ThreadPool::clear()
+std::size_t ThreadPool::clear()
 {
+    std::vector<Task> dropped;
+
+
     {
         std::lock_guard<std::mutex> lock(mtx_);
 
-        discard_tasks_locked();
+        discard_tasks_locked(dropped);
     }
+
+
+    /*
+     * run_dropped() empties the vector, so the count is taken first.
+     */
+    const std::size_t dropped_count =
+        dropped.size();
+
+
+    run_dropped(dropped);
 
 
     /*
@@ -749,6 +917,9 @@ void ThreadPool::clear()
      * The queue is empty now: wake threads waiting on drain.
      */
     cv_idle_.notify_all();
+
+
+    return dropped_count;
 }
 
 
@@ -760,6 +931,9 @@ void ThreadPool::stop(
     PoolStopMode mode
 )
 {
+    std::vector<Task> dropped;
+
+
     {
         std::lock_guard<std::mutex> lock(mtx_);
 
@@ -779,7 +953,7 @@ void ThreadPool::stop(
                     PoolStopMode::IMMEDIATE;
 
 
-                discard_tasks_locked();
+                discard_tasks_locked(dropped);
             }
 
 
@@ -795,6 +969,9 @@ void ThreadPool::stop(
             cv_queue_.notify_all();
 
             cv_idle_.notify_all();
+
+
+            run_dropped(dropped);
 
             return;
         }
@@ -812,9 +989,12 @@ void ThreadPool::stop(
             /*
              * Discard all tasks that have not started yet.
              */
-            discard_tasks_locked();
+            discard_tasks_locked(dropped);
         }
     }
+
+
+    run_dropped(dropped);
 
 
     /*
@@ -881,6 +1061,15 @@ PoolMetrics ThreadPool::get_metrics() const
 
         metrics.active =
             inflight_ + tasks_.size();
+
+        metrics.peak_queue =
+            peak_queue_;
+
+        metrics.workers_created =
+            workers_created_;
+
+        metrics.slots =
+            workers_.size();
     }
 
 

@@ -19,6 +19,19 @@
 #include <vector>
 
 
+/*
+ * Keep these in sync with project(VERSION ...) in CMakeLists.txt.
+ *
+ * Consumers need a compile-time way to detect the API level: batch_size,
+ * wait_until() and the expanded PoolMetrics only exist from 2.1.0 on.
+ */
+#define THREADPOOL_VERSION_MAJOR 2
+#define THREADPOOL_VERSION_MINOR 1
+#define THREADPOOL_VERSION_PATCH 0
+
+#define THREADPOOL_VERSION_STRING "2.1.0"
+
+
 enum class PoolStopMode
 {
     GRACEFUL,   // Finish all remaining queued tasks before stopping
@@ -48,6 +61,33 @@ enum class TaskState
     COMPLETED,
     CANCELLED
 };
+
+
+/*
+ * State and packaged_task of one submission share a single heap block.
+ *
+ * They used to be two independent allocations. The task state is reached
+ * through the aliasing shared_ptr constructor, so pointing at it costs no
+ * control block either.
+ */
+namespace threadpool_detail
+{
+    template <class T>
+    struct TaskBody
+    {
+        template <class Fn>
+        explicit TaskBody(Fn&& fn)
+            : task(std::forward<Fn>(fn))
+        {
+        }
+
+        std::atomic<TaskState> state{
+            TaskState::WAITING
+        };
+
+        std::packaged_task<T()> task;
+    };
+}
 
 
 /**
@@ -129,6 +169,21 @@ struct PoolMetrics
      */
     std::size_t active = 0;
 
+    /*
+     * Diagnostics for capacity tuning.
+     */
+    std::size_t peak_queue = 0;
+
+    std::uint64_t workers_created = 0;
+
+    /*
+     * Worker entries currently held, including threads that exited but
+     * have not been joined yet.
+     *
+     * slots == worker_count means every exited worker was reclaimed.
+     */
+    std::size_t slots = 0;
+
     std::uint64_t submitted = 0;
     std::uint64_t completed = 0;
     std::uint64_t cancelled = 0;
@@ -150,7 +205,16 @@ public:
 
         std::chrono::milliseconds idle_timeout{2000};
 
-        RejectPolicy reject = RejectPolicy::BLOCK;
+        /*
+     * Number of tasks a worker takes out of the queue per critical
+     * section.
+     *
+     * 1 is the classic behavior: one pop per task.
+     * A larger value amortizes the mutex cost over several tiny tasks.
+     */
+    std::size_t batch_size = 1;
+
+    RejectPolicy reject = RejectPolicy::BLOCK;
 
         /*
          * Optional hook executed once at the beginning of every worker
@@ -304,6 +368,20 @@ public:
 
 
     /**
+     * Wait until an absolute deadline.
+     *
+     * Returns true if the pool drained, false on timeout.
+     */
+    template <class Clock, class Duration>
+    bool wait_until(
+        const std::chrono::time_point<
+            Clock,
+            Duration
+        >& deadline
+    );
+
+
+    /**
      * Suspend task execution.
      *
      * Already running tasks are not interrupted, but no queued task is
@@ -322,8 +400,10 @@ public:
      * Drop every queued task that has not started yet.
      *
      * The associated TaskHandles are marked CANCELLED.
+     *
+     * Returns how many tasks were dropped.
      */
-    void clear();
+    std::size_t clear();
 
 
     void set_reject_callback(std::function<void()> cb);
@@ -451,7 +531,23 @@ private:
 
     bool pop_task_locked(Task& out);
 
-    void discard_tasks_locked();
+    /*
+     * Moves every queued task into dropped and returns how many there
+     * were.
+     *
+     * The tasks must be handed to run_task() after releasing the lock:
+     * that is where the promise becomes broken_promise and where the
+     * cancellation is counted.
+     */
+    std::size_t discard_tasks_locked(
+        std::vector<Task>& dropped
+    );
+
+    void run_task(Task& task);
+
+    void run_dropped(std::vector<Task>& dropped);
+
+    void mark_exit_locked();
 
     void worker_loop(Worker* self);
 
@@ -510,6 +606,31 @@ private:
      * task but before that task actually ran.
      */
     std::size_t inflight_ = 0;
+
+
+    /*
+     * Number of workers that left worker_loop() but whose thread has not
+     * been joined yet.
+     *
+     * Used as a cheap "is there anything to reap" test so that a submit
+     * does not have to walk workers_ every time.
+     */
+    std::size_t exited_pending_ = 0;
+
+
+    /*
+     * Largest queue length seen so far.
+     */
+    std::size_t peak_queue_ = 0;
+
+
+    /*
+     * How many worker threads this pool started in total.
+     *
+     * Together with worker_count it shows how often the pool had to grow
+     * and shrink.
+     */
+    std::uint64_t workers_created_ = 0;
 
 
     std::function<void()> reject_callback_;
@@ -745,6 +866,34 @@ bool ThreadPool::wait_for(
 
 
 // ============================================================
+// wait_until
+// ============================================================
+
+template <class Clock, class Duration>
+bool ThreadPool::wait_until(
+    const std::chrono::time_point<
+        Clock,
+        Duration
+    >& deadline
+)
+{
+    std::unique_lock<std::mutex> lock(mtx_);
+
+
+    return cv_idle_.wait_until(
+        lock,
+        deadline,
+        [this]()
+        {
+            return tasks_.empty()
+                &&
+                inflight_ == 0;
+        }
+    );
+}
+
+
+// ============================================================
 // do_submit
 // ============================================================
 
@@ -760,14 +909,27 @@ auto ThreadPool::do_submit(
         std::invoke_result_t<F, Args...>
     >
 {
-    using ReturnType =
-        std::invoke_result_t<F, Args...>;
-
     using Callable =
         std::decay_t<F>;
 
     using ArgsTuple =
         std::tuple<std::decay_t<Args>...>;
+
+
+    static_assert(
+        std::is_invocable_v<
+            Callable&,
+            std::decay_t<Args>...
+        >,
+        "ThreadPool: callable is not invocable with the given arguments"
+    );
+
+
+    using ReturnType =
+        std::invoke_result_t<F, Args...>;
+
+    using Body =
+        threadpool_detail::TaskBody<ReturnType>;
 
 
     /*
@@ -780,10 +942,8 @@ auto ThreadPool::do_submit(
      * std::apply invokes through std::invoke, so member function pointers
      * are supported as well.
      */
-    auto packaged =
-        std::make_shared<
-            std::packaged_task<ReturnType()>
-        >(
+    auto body =
+        std::make_shared<Body>(
             [
                 callable =
                     Callable(
@@ -815,15 +975,22 @@ auto ThreadPool::do_submit(
         );
 
 
-    auto future = packaged->get_future();
+    auto future = body->task.get_future();
 
 
-    auto state =
-        std::make_shared<
-            std::atomic<TaskState>
-        >(
-            TaskState::WAITING
-        );
+    /*
+     * Aliasing shared_ptr: points at TaskBody::state but keeps the whole
+     * body alive.
+     *
+     * TaskHandle, the queue entry and the worker lambda all share this one
+     * control block.
+     */
+    std::shared_ptr<
+        std::atomic<TaskState>
+    > state(
+        body,
+        &body->state
+    );
 
 
     TaskHandle handle(state);
@@ -842,9 +1009,18 @@ auto ThreadPool::do_submit(
     task.state = state;
 
 
+    /*
+     * Capturing the single body pointer keeps this lambda small, so it
+     * usually fits into the std::function small buffer instead of
+     * allocating.
+     */
     task.func =
-        [this, packaged, state]()
+        [this, body]()
         {
+            std::atomic<TaskState>& state_ref =
+                body->state;
+
+
             /*
              * Transition from WAITING to RUNNING.
              *
@@ -855,7 +1031,7 @@ auto ThreadPool::do_submit(
                 TaskState::WAITING;
 
 
-            if(!state->compare_exchange_strong(
+            if(!state_ref.compare_exchange_strong(
                 expected,
                 TaskState::RUNNING,
                 std::memory_order_acq_rel
@@ -868,6 +1044,17 @@ auto ThreadPool::do_submit(
                         std::memory_order_relaxed
                     );
                 }
+
+
+                /*
+                 * This promise will never be fulfilled.
+                 *
+                 * The handle shares ownership of TaskBody, so dropping the
+                 * queue entry alone would not destroy the packaged_task.
+                 * Resetting it here is what turns the caller's future into
+                 * broken_promise instead of blocking it forever.
+                 */
+                body->task.reset();
 
                 return;
             }
@@ -888,7 +1075,7 @@ auto ThreadPool::do_submit(
              */
             try
             {
-                (*packaged)();
+                body->task();
             }
             catch(...)
             {
@@ -905,7 +1092,7 @@ auto ThreadPool::do_submit(
             );
 
 
-            state->store(
+            state_ref.store(
                 TaskState::COMPLETED,
                 std::memory_order_release
             );
@@ -931,7 +1118,10 @@ auto ThreadPool::do_submit(
 
     if(result == SubmitResult::ACCEPTED)
     {
-        cv_task_.notify_one();
+        /*
+         * Nothing to do here: the worker notification - if any - already
+         * happened inside enqueue_task(), while the lock was still held.
+         */
     }
     else if(result == SubmitResult::CALLER_RUNS)
     {
@@ -941,21 +1131,22 @@ auto ThreadPool::do_submit(
          * Execute the task here, outside of any lock, so that a blocked
          * producer still makes progress.
          */
-        try
-        {
-            task.func();
-        }
-        catch(...)
-        {
-            /*
-             * Never propagate a task failure into the submitting thread.
-             */
-        }
+        run_task(task);
     }
     else
     {
         /*
-         * Rejected: inform the caller through the reject callback.
+         * Rejected: nothing will ever run this task, so the future must
+         * not be left waiting for a value that never arrives.
+         *
+         * The handle keeps TaskBody alive, so the packaged_task has to be
+         * abandoned explicitly to break the promise.
+         */
+        body->task.reset();
+
+
+        /*
+         * Inform the caller through the reject callback.
          * It runs outside of the internal lock.
          */
         if(reject_callback)
