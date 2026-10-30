@@ -1,5 +1,47 @@
 #include "threadpool.hpp"
 
+#include <string>
+
+
+namespace
+{
+    /*
+     * The pool whose worker the current thread is, or nullptr.
+     *
+     * Thread local: a thread can only be a worker of one pool at a time,
+     * while a process may hold several pools at once.
+     */
+    thread_local const ThreadPool* t_worker_of = nullptr;
+
+
+    /*
+     * Marks the thread as a worker for the lifetime of the object.
+     *
+     * RAII rather than a manual reset so that the flag is also cleared on
+     * an early return.
+     */
+    struct WorkerScope
+    {
+        explicit WorkerScope(const ThreadPool* pool)
+            : previous_(t_worker_of)
+        {
+            t_worker_of = pool;
+        }
+
+        ~WorkerScope()
+        {
+            t_worker_of = previous_;
+        }
+
+        WorkerScope(const WorkerScope&) = delete;
+
+        WorkerScope& operator=(const WorkerScope&) = delete;
+
+    private:
+        const ThreadPool* previous_;
+    };
+}
+
 
 ThreadPool::ThreadPool(Config cfg)
     : cfg_(std::move(cfg))
@@ -530,6 +572,17 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
 void ThreadPool::worker_loop(Worker* self)
 {
     /*
+     * Tell wait() / wait_for() / wait_until() that the current thread
+     * belongs to this pool.
+     *
+     * Without it, a task that calls wait() would block forever while
+     * holding its own in-flight slot, and the caller would see a hang with
+     * no diagnostic at all.
+     */
+    WorkerScope scope(this);
+
+
+    /*
      * Optional per-thread initialization hook.
      *
      * It runs without any internal lock held, exactly like a user task.
@@ -823,11 +876,43 @@ void ThreadPool::run_task(Task& task)
 
 
 // ============================================================
+// ensure_not_worker
+// ============================================================
+
+void ThreadPool::ensure_not_worker(
+    const char* what
+) const
+{
+    /*
+     * Draining waits for inflight_ to reach zero, and the calling task is
+     * itself counted in inflight_.
+     *
+     * A worker can therefore only be released if some other thread
+     * finishes its work for it, which is not something the pool can
+     * guarantee. Throwing is strictly better than hanging: the caller gets
+     * a stack trace at the offending call site.
+     */
+    if(t_worker_of != this)
+        return;
+
+
+    throw std::logic_error(
+        std::string("ThreadPool: ")
+        + what
+        + "() was called from a task running in the same pool"
+    );
+}
+
+
+// ============================================================
 // wait
 // ============================================================
 
 void ThreadPool::wait()
 {
+    ensure_not_worker("wait");
+
+
     std::unique_lock<std::mutex> lock(mtx_);
 
 
@@ -962,38 +1047,34 @@ void ThreadPool::stop(
              * still executing tasks from draining the queue.
              */
             paused_ = false;
-
-
-            cv_task_.notify_all();
-
-            cv_queue_.notify_all();
-
-            cv_idle_.notify_all();
-
-
-            run_dropped(dropped);
-
-            return;
         }
-
-
-        stopping_ = true;
-
-        stop_mode_ = mode;
-
-        paused_ = false;
-
-
-        if(mode == PoolStopMode::IMMEDIATE)
+        else
         {
-            /*
-             * Discard all tasks that have not started yet.
-             */
-            discard_tasks_locked(dropped);
+            stopping_ = true;
+
+            stop_mode_ = mode;
+
+            paused_ = false;
+
+
+            if(mode == PoolStopMode::IMMEDIATE)
+            {
+                /*
+                 * Discard all tasks that have not started yet.
+                 */
+                discard_tasks_locked(dropped);
+            }
         }
     }
 
 
+    /*
+     * Broken promises and captured destructors must not run under the
+     * mutex: a captured object may call back into the pool.
+     *
+     * Both branches above funnel their dropped tasks here, so a repeated
+     * stop() is handled exactly like the first one.
+     */
     run_dropped(dropped);
 
 

@@ -27,9 +27,9 @@
  */
 #define THREADPOOL_VERSION_MAJOR 2
 #define THREADPOOL_VERSION_MINOR 1
-#define THREADPOOL_VERSION_PATCH 0
+#define THREADPOOL_VERSION_PATCH 1
 
-#define THREADPOOL_VERSION_STRING "2.1.0"
+#define THREADPOOL_VERSION_STRING "2.1.1"
 
 
 enum class PoolStopMode
@@ -104,6 +104,10 @@ public:
 
     bool cancel()
     {
+        if(!state_)
+            return false;
+
+
         TaskState expected = TaskState::WAITING;
 
         return state_->compare_exchange_strong(
@@ -115,12 +119,20 @@ public:
 
     bool is_cancelled() const
     {
+        if(!state_)
+            return false;
+
+
         return state_->load(std::memory_order_acquire)
             == TaskState::CANCELLED;
     }
 
     TaskState state() const
     {
+        if(!state_)
+            return TaskState::WAITING;
+
+
         return state_->load(std::memory_order_acquire);
     }
 
@@ -137,10 +149,14 @@ private:
     }
 
 private:
-    std::shared_ptr<std::atomic<TaskState>> state_ =
-        std::make_shared<std::atomic<TaskState>>(
-            TaskState::WAITING
-        );
+    /*
+     * A default-constructed handle is not attached to any task: it owns no
+     * state, and cancel() / is_cancelled() / state() are no-ops on it.
+     *
+     * Previously this allocated a fresh atomic, which made valid() report
+     * true for a handle that could never control anything.
+     */
+    std::shared_ptr<std::atomic<TaskState>> state_;
 
     friend class ThreadPool;
 };
@@ -206,15 +222,17 @@ public:
         std::chrono::milliseconds idle_timeout{2000};
 
         /*
-     * Number of tasks a worker takes out of the queue per critical
-     * section.
-     *
-     * 1 is the classic behavior: one pop per task.
-     * A larger value amortizes the mutex cost over several tiny tasks.
-     */
-    std::size_t batch_size = 1;
+         * Number of tasks a worker takes out of the queue per critical
+         * section.
+         *
+         * 1 is the classic behavior: one pop per task.
+         * A larger value amortizes the mutex cost over several tiny tasks.
+         *
+         * Values below 1 are treated as 1.
+         */
+        std::size_t batch_size = 1;
 
-    RejectPolicy reject = RejectPolicy::BLOCK;
+        RejectPolicy reject = RejectPolicy::BLOCK;
 
         /*
          * Optional hook executed once at the beginning of every worker
@@ -349,6 +367,8 @@ public:
      * Never call wait() / wait_for() from inside a task of the same pool.
      * The waiting count includes the caller's own task, so the wait could
      * never complete.
+     *
+     * Such a call is detected and throws std::logic_error.
      */
     void wait();
 
@@ -556,6 +576,18 @@ private:
     void maybe_expand_locked();
 
     void reap_workers_locked();
+
+
+    /*
+     * wait() and friends count the calling task as in-flight work, so a
+     * call from a worker of the same pool can never be satisfied.
+     *
+     * Such a call is a programming error. Detecting it turns an
+     * unconditional hang into an immediate std::logic_error.
+     */
+    void ensure_not_worker(
+        const char* what
+    ) const;
 
 
 private:
@@ -849,6 +881,9 @@ bool ThreadPool::wait_for(
     >& timeout
 )
 {
+    ensure_not_worker("wait_for");
+
+
     std::unique_lock<std::mutex> lock(mtx_);
 
 
@@ -877,6 +912,9 @@ bool ThreadPool::wait_until(
     >& deadline
 )
 {
+    ensure_not_worker("wait_until");
+
+
     std::unique_lock<std::mutex> lock(mtx_);
 
 
