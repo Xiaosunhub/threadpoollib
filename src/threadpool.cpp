@@ -1275,3 +1275,41 @@ void ThreadPool::resize(
      * at the new min instead of bouncing back up to the old ceiling.
      */
 }
+
+
+// ============================================================
+// set_idle_timeout
+// ============================================================
+
+void ThreadPool::set_idle_timeout(
+    std::chrono::milliseconds timeout
+)
+{
+    if(timeout.count() <= 0)
+    {
+        throw std::invalid_argument(
+            "idle_timeout must be > 0"
+        );
+    }
+
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+
+    cfg_.idle_timeout = timeout;
+}
+
+
+// ============================================================
+// set_reject_policy
+// ============================================================
+
+void ThreadPool::set_reject_policy(
+    RejectPolicy policy
+)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+
+    cfg_.reject = policy;
+}

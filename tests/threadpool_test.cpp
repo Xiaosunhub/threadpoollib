@@ -1083,6 +1083,138 @@ static void test_resize()
 }
 
 
+// ------------------------------------------------------------
+// Runtime configuration
+// ------------------------------------------------------------
+
+static void test_runtime_config()
+{
+    ThreadPool pool(make_config());
+
+
+    /* A non-positive idle timeout is rejected. */
+    bool threw = false;
+
+    try
+    {
+        pool.set_idle_timeout(
+            std::chrono::milliseconds(0)
+        );
+    }
+    catch(const std::invalid_argument&)
+    {
+        threw = true;
+    }
+
+    expect(
+        threw,
+        "set_idle_timeout rejects <= 0"
+    );
+
+
+    /* A valid idle timeout does not disturb normal execution. */
+    pool.set_idle_timeout(
+        std::chrono::milliseconds(150)
+    );
+
+    auto v = pool.submit(
+        []()
+        {
+            return 123;
+        }
+    );
+
+    expect(
+        v.get() == 123,
+        "pool still works after set_idle_timeout"
+    );
+
+
+    /*
+     * set_reject_policy must take effect on the next full-queue submit.
+     *
+     * With a single worker and a full queue, BLOCK would make submit()
+     * block forever; switching to DISCARD must make it throw instead.
+     */
+    ThreadPool::Config cfg = make_config();
+
+    cfg.min_threads = 1;
+    cfg.max_threads = 1;
+    cfg.max_queue = 1;
+
+    ThreadPool limited(cfg);
+
+
+    std::promise<void> release;
+
+    std::shared_future<void> gate =
+        release.get_future().share();
+
+    std::promise<void> started;
+
+    auto blocker =
+        limited.submit(
+            [gate, &started]()
+            {
+                started.set_value();
+
+                gate.wait();
+            }
+        );
+
+    started.get_future().wait();
+
+
+    /*
+     * The worker is stuck on the blocker, so this task lands in the queue
+     * and fills it (max_queue == 1).
+     */
+    auto queued =
+        limited.submit(
+            []()
+            {
+                return 0;
+            }
+        );
+
+
+    /* Now the queue is full. Switch the policy, then submit again. */
+    limited.set_reject_policy(
+        RejectPolicy::DISCARD
+    );
+
+
+    bool rejected = false;
+
+    try
+    {
+        limited.submit(
+            []()
+            {
+                return 0;
+            }
+        );
+    }
+    catch(const std::runtime_error&)
+    {
+        rejected = true;
+    }
+
+    expect(
+        rejected,
+        "set_reject_policy(DISCARD) makes a full queue throw"
+    );
+
+
+    (void)queued;
+
+
+    release.set_value();
+
+    blocker.wait();
+}
+
+
 int main()
 {
     test_basics();
@@ -1104,6 +1236,8 @@ int main()
     test_clear_and_caller_runs();
 
     test_resize();
+
+    test_runtime_config();
 
 
     std::printf(

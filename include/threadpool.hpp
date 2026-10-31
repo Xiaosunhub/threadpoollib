@@ -27,9 +27,9 @@
  */
 #define THREADPOOL_VERSION_MAJOR 2
 #define THREADPOOL_VERSION_MINOR 1
-#define THREADPOOL_VERSION_PATCH 3
+#define THREADPOOL_VERSION_PATCH 4
 
-#define THREADPOOL_VERSION_STRING "2.1.3"
+#define THREADPOOL_VERSION_STRING "2.1.4"
 
 
 enum class PoolStopMode
@@ -463,6 +463,31 @@ public:
     void resize(
         std::size_t min_threads,
         std::size_t max_threads
+    );
+
+
+    /**
+     * Change the idle timeout at runtime.
+     *
+     * A worker that is already inside its idle wait_for() picks up the new
+     * value on its next wait cycle, so the change takes effect without
+     * restarting the pool.
+     *
+     * Throws std::invalid_argument if timeout <= 0.
+     */
+    void set_idle_timeout(
+        std::chrono::milliseconds timeout
+    );
+
+
+    /**
+     * Change the rejection policy at runtime.
+     *
+     * Applies to the next submit() / try_submit() that finds a full queue,
+     * letting a stall be rerouted to DISCARD or CALLER_RUNS on the fly.
+     */
+    void set_reject_policy(
+        RejectPolicy policy
     );
 
 
