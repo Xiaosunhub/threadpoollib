@@ -971,6 +971,118 @@ static void test_clear_and_caller_runs()
 }
 
 
+// ------------------------------------------------------------
+// Runtime resize
+// ------------------------------------------------------------
+
+static void test_resize()
+{
+    ThreadPool::Config cfg = make_config();
+
+    cfg.min_threads = 2;
+    cfg.max_threads = 8;
+    cfg.idle_timeout =
+        std::chrono::milliseconds(300);
+
+
+    ThreadPool pool(cfg);
+
+
+    /*
+     * Raising the floor must create the missing workers immediately.
+     *
+     * worker_count_ is incremented inside create_worker_locked() before the
+     * thread actually starts, so the metric reflects the new floor without
+     * waiting for the threads to spin up.
+     */
+    pool.resize(5, 8);
+
+    expect(
+        pool.get_metrics().worker_count == 5,
+        "resize raises worker_count to the new min"
+    );
+
+
+    /*
+     * Lower the ceiling and the floor.
+     *
+     * The 5 idle workers must not be killed mid-task (they have none), but
+     * they should shed down to the new min as they go idle.
+     */
+    pool.resize(2, 4);
+
+    pool.wait_for(
+        std::chrono::seconds(5)
+    );
+
+
+    const bool lowered = spin_until(
+        [&pool]()
+        {
+            return pool.get_metrics().worker_count <= 4;
+        },
+        3000
+    );
+
+
+    expect(
+        lowered,
+        "resize lowers the burst ceiling"
+    );
+
+
+    const bool settled = spin_until(
+        [&pool]()
+        {
+            return pool.get_metrics().worker_count == 2;
+        },
+        3000
+    );
+
+
+    expect(
+        settled,
+        "pool settles at the new min after resize"
+    );
+
+
+    /* Invalid configurations are rejected, same as the constructor. */
+
+    bool threw = false;
+
+    try
+    {
+        pool.resize(0, 4);
+    }
+    catch(const std::invalid_argument&)
+    {
+        threw = true;
+    }
+
+    expect(
+        threw,
+        "resize rejects min_threads == 0"
+    );
+
+
+    threw = false;
+
+    try
+    {
+        pool.resize(5, 3);
+    }
+    catch(const std::invalid_argument&)
+    {
+        threw = true;
+    }
+
+    expect(
+        threw,
+        "resize rejects max_threads < min_threads"
+    );
+}
+
+
 int main()
 {
     test_basics();
@@ -990,6 +1102,8 @@ int main()
     test_shutdown();
 
     test_clear_and_caller_runs();
+
+    test_resize();
 
 
     std::printf(

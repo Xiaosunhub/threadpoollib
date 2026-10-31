@@ -1220,3 +1220,58 @@ bool ThreadPool::is_stopped() const
 
     return stopping_;
 }
+
+
+// ============================================================
+// resize
+// ============================================================
+
+void ThreadPool::resize(
+    std::size_t min_threads,
+    std::size_t max_threads
+)
+{
+    if(min_threads == 0)
+    {
+        throw std::invalid_argument(
+            "min_threads must be >= 1"
+        );
+    }
+
+
+    if(max_threads < min_threads)
+    {
+        throw std::invalid_argument(
+            "max_threads must be >= min_threads"
+        );
+    }
+
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+
+    cfg_.min_threads = min_threads;
+
+    cfg_.max_threads = max_threads;
+
+
+    /*
+     * Grow toward the new floor right away.
+     *
+     * create_worker_locked() already honors stopping_ and the (possibly
+     * raised) max_threads cap, so this cannot over-allocate.
+     */
+    while(worker_count_ < cfg_.min_threads)
+    {
+        create_worker_locked();
+    }
+
+
+    /*
+     * A lowered max_threads only bites as workers go idle.
+     *
+     * They are not interrupted mid-task: the existing idle-timeout shrink
+     * path enforces worker_count_ > min_threads, so the pool simply settles
+     * at the new min instead of bouncing back up to the old ceiling.
+     */
+}

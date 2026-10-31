@@ -27,9 +27,9 @@
  */
 #define THREADPOOL_VERSION_MAJOR 2
 #define THREADPOOL_VERSION_MINOR 1
-#define THREADPOOL_VERSION_PATCH 2
+#define THREADPOOL_VERSION_PATCH 3
 
-#define THREADPOOL_VERSION_STRING "2.1.2"
+#define THREADPOOL_VERSION_STRING "2.1.3"
 
 
 enum class PoolStopMode
@@ -441,6 +441,29 @@ public:
 
 
     bool is_stopped() const;
+
+
+    /**
+     * Change the dynamic sizing bounds at runtime.
+     *
+     * The same rules as the constructor apply:
+     *
+     *   - min_threads must stay >= 1
+     *   - max_threads must stay >= min_threads
+     *
+     * std::invalid_argument is thrown otherwise.
+     *
+     * Raising min_threads starts the missing workers immediately, so the
+     * new floor is honored without waiting for load.
+     *
+     * Lowering max_threads never kills a worker that is currently running
+     * a task. Surplus workers are shed as they go idle, which is exactly
+     * how the pool already settles after a burst.
+     */
+    void resize(
+        std::size_t min_threads,
+        std::size_t max_threads
+    );
 
 
 private:
