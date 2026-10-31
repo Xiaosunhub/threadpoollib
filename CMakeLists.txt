@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     threadpool
-    VERSION 2.1.1
+    VERSION 2.1.2
     LANGUAGES CXX
 )
 
@@ -66,6 +66,38 @@ if(THREADPOOL_BUILD_EXAMPLE)
         threadpooluse
         PRIVATE
             threadpool::threadpool
+    )
+
+endif()
+
+# ------------------------------------------------------------
+# Tests
+# ------------------------------------------------------------
+
+option(
+    THREADPOOL_BUILD_TESTS
+    "Build threadpool regression tests"
+    OFF
+)
+
+if(THREADPOOL_BUILD_TESTS)
+
+    enable_testing()
+
+    add_executable(
+        threadpool_tests
+        tests/threadpool_test.cpp
+    )
+
+    target_link_libraries(
+        threadpool_tests
+        PRIVATE
+            threadpool::threadpool
+    )
+
+    add_test(
+        NAME threadpool_tests
+        COMMAND threadpool_tests
     )
 
 endif()

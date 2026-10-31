@@ -668,6 +668,20 @@ void ThreadPool::worker_loop(Worker* self)
             if(timed_out)
             {
                 /*
+                 * A pause that began while this worker was already waiting
+                 * also makes wait_for() time out: its predicate is false
+                 * for as long as paused_ holds.
+                 *
+                 * That timeout is not idleness. Shrinking here would drag
+                 * the pool down to min_threads purely because it was
+                 * paused, which is exactly what the paused branch above
+                 * exists to prevent.
+                 */
+                if(paused_)
+                    continue;
+
+
+                /*
                  * Dynamically shrink the pool.
                  *
                  * Only workers above min_threads are allowed to exit.
