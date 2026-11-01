@@ -1215,6 +1215,194 @@ static void test_runtime_config()
 }
 
 
+// ------------------------------------------------------------
+// Scheduled tasks, parallel algorithms, local (nested) queue
+// ------------------------------------------------------------
+
+static void test_scheduled_and_parallel()
+{
+    using namespace std::chrono_literals;
+
+
+    /* submit_after() runs only after its delay. */
+    {
+        ThreadPool pool(make_config());
+
+        auto f = pool.submit_after(
+            150ms,
+            []()
+            {
+                return 7;
+            }
+        );
+
+        /*
+         * Before the delay elapses the result must not be ready.
+         */
+        const bool not_ready =
+            f.wait_for(20ms)
+                == std::future_status::timeout;
+
+        expect(
+            not_ready,
+            "submit_after is not ready before its delay"
+        );
+
+        expect(
+            f.get() == 7,
+            "submit_after runs after the delay"
+        );
+    }
+
+
+    /*
+     * Cancelling a deferred task before its deadline breaks its future
+     * with broken_promise instead of running it.
+     */
+    {
+        ThreadPool pool(make_config());
+
+        auto h = pool.submit_cancellable_after(
+            300ms,
+            0,
+            []()
+            {
+                return 1;
+            }
+        );
+
+        const bool cancelled = h.handle.cancel();
+
+        expect(
+            cancelled,
+            "scheduled task can be cancelled before it runs"
+        );
+
+        bool threw = false;
+
+        try
+        {
+            h.future.get();
+        }
+        catch(const std::future_error&)
+        {
+            threw = true;
+        }
+
+        expect(
+            threw,
+            "cancelling a scheduled task breaks its future"
+        );
+    }
+
+
+    /* parallel_for covers every index exactly once. */
+    {
+        ThreadPool pool(make_config());
+
+        const std::size_t n = 100000;
+
+        std::atomic<std::size_t> count{0};
+
+        pool.parallel_for(
+            0,
+            n,
+            1024,
+            [&count](std::size_t i)
+            {
+                (void)i;
+
+                count.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
+            }
+        ).get();
+
+        expect(
+            count.load() == n,
+            "parallel_for covers the whole range"
+        );
+    }
+
+
+    /* parallel_reduce computes the correct total. */
+    {
+        ThreadPool pool(make_config());
+
+        const std::size_t n = 100000;
+
+        const std::size_t sum =
+            pool.parallel_reduce(
+                0,
+                n,
+                1024,
+                std::size_t(0),
+                [](std::size_t b, std::size_t e)
+                {
+                    std::size_t s = 0;
+
+                    for(std::size_t i = b; i < e; ++i)
+                        s += i;
+
+                    return s;
+                },
+                [](std::size_t a, std::size_t b)
+                {
+                    return a + b;
+                }
+            ).get();
+
+        const std::size_t expected =
+            n * (n - 1) / 2;
+
+        expect(
+            sum == expected,
+            "parallel_reduce computes the correct sum"
+        );
+    }
+
+
+    /*
+     * A task that submits more work from inside the pool routes those
+     * nested tasks onto the worker's own local queue.
+     *
+     * wait() counts local_pending_, so it drains them too.
+     */
+    {
+        ThreadPool pool(make_config());
+
+        std::atomic<int> nested{0};
+
+
+        pool.submit(
+            [&pool, &nested]()
+            {
+                for(int i = 0; i < 50; ++i)
+                {
+                    pool.submit(
+                        [&nested]()
+                        {
+                            nested.fetch_add(
+                                1,
+                                std::memory_order_relaxed
+                            );
+                        }
+                    );
+                }
+            }
+        ).get();
+
+        pool.wait();
+
+        expect(
+            nested.load() == 50,
+            "nested submits run via the worker local queue"
+        );
+    }
+}
+
+
 int main()
 {
     test_basics();
@@ -1238,6 +1426,8 @@ int main()
     test_resize();
 
     test_runtime_config();
+
+    test_scheduled_and_parallel();
 
 
     std::printf(

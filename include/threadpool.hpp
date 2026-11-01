@@ -5,8 +5,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -23,13 +26,15 @@
  * Keep these in sync with project(VERSION ...) in CMakeLists.txt.
  *
  * Consumers need a compile-time way to detect the API level: batch_size,
- * wait_until() and the expanded PoolMetrics only exist from 2.1.0 on.
+ * wait_until() and the expanded PoolMetrics only exist from 2.1.0 on;
+ * scheduling (submit_at / submit_after), parallel_for / parallel_reduce
+ * and per-worker local queues arrive with 3.0.0.
  */
-#define THREADPOOL_VERSION_MAJOR 2
-#define THREADPOOL_VERSION_MINOR 1
-#define THREADPOOL_VERSION_PATCH 4
+#define THREADPOOL_VERSION_MAJOR 3
+#define THREADPOOL_VERSION_MINOR 0
+#define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "2.1.4"
+#define THREADPOOL_VERSION_STRING "3.0.0"
 
 
 enum class PoolStopMode
@@ -205,6 +210,13 @@ struct PoolMetrics
     std::uint64_t cancelled = 0;
     std::uint64_t rejected = 0;
     std::uint64_t running = 0;
+
+
+    /*
+     * Tasks currently held for a future execution time, i.e. deferred by
+     * submit_after() / submit_at(). They are not yet in the runnable queue.
+     */
+    std::size_t scheduled = 0;
 };
 
 
@@ -360,6 +372,180 @@ public:
         >;
 
 
+    // ============================================================
+    // Scheduled tasks (3.0.0)
+    // ============================================================
+
+    /**
+     * Submit a task that runs after the given delay.
+     *
+     * Returns a future (priority 0). Throws if the pool is already stopped.
+     */
+    template <class Rep, class Period, class F, class... Args>
+    auto submit_after(
+        const std::chrono::duration<
+            Rep,
+            Period
+        >& delay,
+        F&& f,
+        Args&&... args
+    )
+        -> std::future<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    /**
+     * Submit a task that runs at the given steady_clock deadline.
+     *
+     * Priority defaults to 0.
+     */
+    template <class F, class... Args>
+    auto submit_at(
+        std::chrono::steady_clock::time_point at,
+        F&& f,
+        Args&&... args
+    )
+        -> std::future<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class F, class... Args>
+    auto submit_cancellable_at(
+        std::chrono::steady_clock::time_point at,
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class Rep, class Period, class F, class... Args>
+    auto submit_cancellable_after(
+        const std::chrono::duration<
+            Rep,
+            Period
+        >& delay,
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class F, class... Args>
+    auto try_submit_at(
+        std::chrono::steady_clock::time_point at,
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> std::optional<
+            std::future<
+                std::invoke_result_t<F, Args...>
+            >
+        >;
+
+
+    template <class Rep, class Period, class F, class... Args>
+    auto try_submit_after(
+        const std::chrono::duration<
+            Rep,
+            Period
+        >& delay,
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> std::optional<
+            std::future<
+                std::invoke_result_t<F, Args...>
+            >
+        >;
+
+
+    template <class F, class... Args>
+    auto try_submit_cancellable_at(
+        std::chrono::steady_clock::time_point at,
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> std::optional<
+            TaskResult<
+                std::invoke_result_t<F, Args...>
+            >
+        >;
+
+
+    template <class Rep, class Period, class F, class... Args>
+    auto try_submit_cancellable_after(
+        const std::chrono::duration<
+            Rep,
+            Period
+        >& delay,
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> std::optional<
+            TaskResult<
+                std::invoke_result_t<F, Args...>
+            >
+        >;
+
+
+    // ============================================================
+    // Parallel algorithms (3.0.0)
+    // ============================================================
+
+    /**
+     * Run f(i) for every i in [begin, end) across the pool.
+     *
+     * The range is split into chunks of at most grainsize indices; each
+     * chunk is submitted as a task. Returns a future that completes once
+     * every invocation has finished.
+     */
+    template <class F>
+    std::future<void> parallel_for(
+        std::size_t begin,
+        std::size_t end,
+        std::size_t grainsize,
+        F&& f
+    );
+
+
+    template <class F>
+    std::future<void> parallel_for(
+        std::size_t begin,
+        std::size_t end,
+        F&& f
+    );
+
+
+    /**
+     * Parallel reduction.
+     *
+     * f(begin, end) computes the partial result of one chunk; op(left, right)
+     * combines two partial results. init is the neutral element supplied for
+     * the whole range. Returns a future with the combined result.
+     */
+    template <class T, class F, class BinOp>
+    std::future<T> parallel_reduce(
+        std::size_t begin,
+        std::size_t end,
+        std::size_t grainsize,
+        T init,
+        F&& f,
+        BinOp&& op
+    );
+
+
     /**
      * Wait until the queue is empty and every task has finished.
      *
@@ -505,6 +691,22 @@ private:
     };
 
 
+    /*
+     * Result of make_task(): the ready-to-run Task plus the cancellation
+     * handle / future and the owning TaskBody.
+     *
+     * body is handed back so the caller can abandon the packaged_task
+     * (break the promise) when the task is rejected instead of enqueued.
+     */
+    template <class T>
+    struct BuiltTask
+    {
+        Task task;
+        TaskResult<T> result;
+        std::shared_ptr<threadpool_detail::TaskBody<T>> body;
+    };
+
+
     struct TaskCompare
     {
         bool operator()(
@@ -556,12 +758,23 @@ private:
      * finished is set by the worker itself after it left worker_loop().
      * The pool uses it to reap exited std::thread objects instead of
      * letting them accumulate forever.
+     *
+     * local is a per-worker LIFO queue for tasks submitted from inside a
+     * task that runs on this worker. Routing nested submissions there keeps
+     * them off the shared global queue, so recursive / fork-join patterns
+     * (parallel_for, parallel_reduce) never serialize on the global mutex.
+     * The owning worker is the only producer and the only consumer, so the
+     * mutex is uncontended in the common case.
      */
     struct Worker
     {
         std::thread thread;
 
         std::atomic<bool> finished{false};
+
+        std::mutex local_mtx;
+
+        std::deque<Task> local;
     };
 
 
@@ -589,6 +802,55 @@ private:
         int priority,
         bool allow_wait,
         SubmitResult& status,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    /*
+     * Builds the Task, its future and its cancellation handle without
+     * touching any queue.
+     *
+     * Shared by do_submit() (immediate) and do_schedule_at() (deferred) so
+     * the callable binding / move-only handling lives in exactly one place.
+     */
+    template <class F, class... Args>
+    auto make_task(
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class F, class... Args>
+    auto do_schedule_at(
+        int priority,
+        bool allow_wait,
+        SubmitResult& status,
+        std::chrono::steady_clock::time_point at,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class Rep, class Period, class F, class... Args>
+    auto do_schedule_after(
+        int priority,
+        bool allow_wait,
+        SubmitResult& status,
+        const std::chrono::duration<
+            Rep,
+            Period
+        >& delay,
         F&& f,
         Args&&... args
     )
@@ -627,6 +889,27 @@ private:
 
 
     /*
+     * Move every scheduled task whose deadline has passed into tasks_ (the
+     * runnable priority queue), preserving its priority.
+     *
+     * The caller must hold mtx_. Never promotes while paused_: a paused pool
+     * must not start draining deferred work.
+     */
+    void promote_scheduled_locked();
+
+
+    /*
+     * Smallest scheduled deadline, or steady_clock::time_point::max() when
+     * nothing is scheduled. Caller must hold mtx_.
+     */
+    std::chrono::steady_clock::time_point
+        next_scheduled_locked() const;
+
+
+    bool has_due_scheduled_locked() const;
+
+
+    /*
      * wait() and friends count the calling task as in-flight work, so a
      * call from a worker of the same pool can never be satisfied.
      *
@@ -644,6 +927,18 @@ private:
 
 
     TaskQueue tasks_;
+
+
+    /*
+     * Deferred tasks, keyed by their steady_clock deadline.
+     *
+     * Guarded by mtx_. promote_scheduled_locked() moves the due ones into
+     * tasks_ when a worker wakes up; clear() / stop() drain it as well.
+     */
+    std::multimap<
+        std::chrono::steady_clock::time_point,
+        Task
+    > scheduled_;
 
 
     /*
@@ -686,6 +981,16 @@ private:
      * task but before that task actually ran.
      */
     std::size_t inflight_ = 0;
+
+
+    /*
+     * Tasks sitting in a worker's local deque but not yet executed.
+     *
+     * Incremented when a task is pushed to a local deque (always by the
+     * owning worker) and decremented when any worker pops it. Together with
+     * inflight_ and the two queues it feeds the wait() predicate.
+     */
+    std::atomic<std::size_t> local_pending_{0};
 
 
     /*
@@ -942,7 +1247,13 @@ bool ThreadPool::wait_for(
         {
             return tasks_.empty()
                 &&
-                inflight_ == 0;
+                inflight_ == 0
+                &&
+                scheduled_.empty()
+                &&
+                local_pending_.load(
+                    std::memory_order_relaxed
+                ) == 0;
         }
     );
 }
@@ -973,7 +1284,13 @@ bool ThreadPool::wait_until(
         {
             return tasks_.empty()
                 &&
-                inflight_ == 0;
+                inflight_ == 0
+                &&
+                scheduled_.empty()
+                &&
+                local_pending_.load(
+                    std::memory_order_relaxed
+                ) == 0;
         }
     );
 }
@@ -1259,6 +1576,829 @@ auto ThreadPool::do_submit(
         std::move(future),
         std::move(handle)
     };
+}
+
+
+// ============================================================
+// do_schedule_at
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::do_schedule_at(
+    int priority,
+    bool allow_wait,
+    SubmitResult& status,
+    std::chrono::steady_clock::time_point at,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    using Callable =
+        std::decay_t<F>;
+
+    using ArgsTuple =
+        std::tuple<std::decay_t<Args>...>;
+
+    using ReturnType =
+        std::invoke_result_t<F, Args...>;
+
+    using Body =
+        threadpool_detail::TaskBody<ReturnType>;
+
+
+    static_assert(
+        std::is_invocable_v<
+            Callable&,
+            std::decay_t<Args>...
+        >,
+        "ThreadPool: callable is not invocable with the given arguments"
+    );
+
+
+    auto body =
+        std::make_shared<Body>(
+            [
+                callable =
+                    Callable(
+                        std::forward<F>(f)
+                    ),
+                bound =
+                    ArgsTuple(
+                        std::forward<Args>(args)...
+                    )
+            ]() mutable -> ReturnType
+            {
+                if constexpr(
+                    std::is_void_v<ReturnType>
+                )
+                {
+                    std::apply(
+                        std::move(callable),
+                        std::move(bound)
+                    );
+                }
+                else
+                {
+                    return std::apply(
+                        std::move(callable),
+                        std::move(bound)
+                    );
+                }
+            }
+        );
+
+
+    auto future = body->task.get_future();
+
+
+    std::shared_ptr<
+        std::atomic<TaskState>
+    > state(
+        body,
+        &body->state
+    );
+
+
+    TaskHandle handle(state);
+
+
+    Task task;
+
+    task.priority = priority;
+
+    task.sequence =
+        sequence_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+    task.state = state;
+
+
+    task.func =
+        [this, body]()
+        {
+            std::atomic<TaskState>& state_ref =
+                body->state;
+
+
+            TaskState expected =
+                TaskState::WAITING;
+
+
+            if(!state_ref.compare_exchange_strong(
+                expected,
+                TaskState::RUNNING,
+                std::memory_order_acq_rel
+            ))
+            {
+                if(expected == TaskState::CANCELLED)
+                {
+                    cancelled_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                }
+
+
+                body->task.reset();
+
+                return;
+            }
+
+
+            running_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+
+            try
+            {
+                body->task();
+            }
+            catch(...)
+            {
+            }
+
+
+            running_.fetch_sub(
+                1,
+                std::memory_order_relaxed
+            );
+
+
+            state_ref.store(
+                TaskState::COMPLETED,
+                std::memory_order_release
+            );
+
+
+            completed_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+        };
+
+
+    std::function<void()> reject_callback;
+
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+
+        /*
+         * A stopped pool cannot accept deferred work either: failing to do
+         * so would let a future hang forever waiting for a task that the
+         * pool will never run.
+         */
+        if(stopping_)
+        {
+            rejected_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+
+            reject_callback = reject_callback_;
+
+
+            status = SubmitResult::REJECTED_STOPPED;
+
+
+            body->task.reset();
+
+
+            if(reject_callback)
+            {
+                try
+                {
+                    reject_callback();
+                }
+                catch(...)
+                {
+                }
+            }
+
+
+            return TaskResult<ReturnType>{
+                std::move(future),
+                std::move(handle)
+            };
+        }
+
+
+        /*
+         * Deferred tasks are not subject to max_queue: they are time-bound,
+         * not pressure-bound, and counting them against the pressure limit
+         * would make submit_after() surprising.
+         */
+        scheduled_.emplace(
+            at,
+            std::move(task)
+        );
+
+        submitted_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+    }
+
+
+    /*
+     * Wake idle workers so they recompute their wait deadline. A newly
+     * scheduled task with an earlier deadline than the one a worker is
+     * already waiting on must be noticed.
+     */
+    cv_task_.notify_all();
+
+
+    status = SubmitResult::ACCEPTED;
+
+
+    return TaskResult<ReturnType>{
+        std::move(future),
+        std::move(handle)
+    };
+}
+
+
+// ============================================================
+// do_schedule_after
+// ============================================================
+
+template <class Rep, class Period, class F, class... Args>
+auto ThreadPool::do_schedule_after(
+    int priority,
+    bool allow_wait,
+    SubmitResult& status,
+    const std::chrono::duration<
+        Rep,
+        Period
+    >& delay,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    auto at =
+        std::chrono::steady_clock::now()
+        + delay;
+
+
+    return do_schedule_at(
+        priority,
+        allow_wait,
+        status,
+        at,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+// ============================================================
+// submit_at / submit_after
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::submit_at(
+    std::chrono::steady_clock::time_point at,
+    F&& f,
+    Args&&... args
+)
+    -> std::future<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_schedule_at(
+        0,
+        true,
+        status,
+        at,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status == SubmitResult::REJECTED_STOPPED)
+    {
+        throw std::runtime_error(
+            "ThreadPool already stopped"
+        );
+    }
+
+
+    return std::move(result.future);
+}
+
+
+template <class Rep, class Period, class F, class... Args>
+auto ThreadPool::submit_after(
+    const std::chrono::duration<
+        Rep,
+        Period
+    >& delay,
+    F&& f,
+    Args&&... args
+)
+    -> std::future<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return submit_at(
+        std::chrono::steady_clock::now()
+        + delay,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <class F, class... Args>
+auto ThreadPool::submit_cancellable_at(
+    std::chrono::steady_clock::time_point at,
+    int priority,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_schedule_at(
+        priority,
+        true,
+        status,
+        at,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status == SubmitResult::REJECTED_STOPPED)
+    {
+        throw std::runtime_error(
+            "ThreadPool already stopped"
+        );
+    }
+
+
+    return result;
+}
+
+
+template <class Rep, class Period, class F, class... Args>
+auto ThreadPool::submit_cancellable_after(
+    const std::chrono::duration<
+        Rep,
+        Period
+    >& delay,
+    int priority,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return submit_cancellable_at(
+        std::chrono::steady_clock::now()
+        + delay,
+        priority,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <class F, class... Args>
+auto ThreadPool::try_submit_at(
+    std::chrono::steady_clock::time_point at,
+    int priority,
+    F&& f,
+    Args&&... args
+)
+    -> std::optional<
+        std::future<
+            std::invoke_result_t<F, Args...>
+        >
+    >
+{
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_schedule_at(
+        priority,
+        false,
+        status,
+        at,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status != SubmitResult::ACCEPTED)
+        return std::nullopt;
+
+
+    return std::move(result.future);
+}
+
+
+template <class Rep, class Period, class F, class... Args>
+auto ThreadPool::try_submit_after(
+    const std::chrono::duration<
+        Rep,
+        Period
+    >& delay,
+    int priority,
+    F&& f,
+    Args&&... args
+)
+    -> std::optional<
+        std::future<
+            std::invoke_result_t<F, Args...>
+        >
+    >
+{
+    return try_submit_at(
+        std::chrono::steady_clock::now()
+        + delay,
+        priority,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <class F, class... Args>
+auto ThreadPool::try_submit_cancellable_at(
+    std::chrono::steady_clock::time_point at,
+    int priority,
+    F&& f,
+    Args&&... args
+)
+    -> std::optional<
+        TaskResult<
+            std::invoke_result_t<F, Args...>
+        >
+    >
+{
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_schedule_at(
+        priority,
+        false,
+        status,
+        at,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status != SubmitResult::ACCEPTED)
+        return std::nullopt;
+
+
+    return result;
+}
+
+
+template <class Rep, class Period, class F, class... Args>
+auto ThreadPool::try_submit_cancellable_after(
+    const std::chrono::duration<
+        Rep,
+        Period
+    >& delay,
+    int priority,
+    F&& f,
+    Args&&... args
+)
+    -> std::optional<
+        TaskResult<
+            std::invoke_result_t<F, Args...>
+        >
+    >
+{
+    return try_submit_cancellable_at(
+        std::chrono::steady_clock::now()
+        + delay,
+        priority,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+// ============================================================
+// parallel_for
+// ============================================================
+
+namespace threadpool_detail
+{
+    template <class T>
+    struct ParallelState
+    {
+        std::mutex mtx;
+
+        std::exception_ptr ex;
+
+        bool has_ex = false;
+
+        std::atomic<std::size_t> remaining{0};
+
+        std::promise<T> promise;
+
+        T acc;
+    };
+
+
+    template <>
+    struct ParallelState<void>
+    {
+        std::mutex mtx;
+
+        std::exception_ptr ex;
+
+        bool has_ex = false;
+
+        std::atomic<std::size_t> remaining{0};
+
+        std::promise<void> promise;
+    };
+}
+
+
+template <class F>
+std::future<void> ThreadPool::parallel_for(
+    std::size_t begin,
+    std::size_t end,
+    std::size_t grainsize,
+    F&& f
+)
+{
+    if(grainsize == 0)
+        grainsize = 1;
+
+
+    ensure_not_worker("parallel_for");
+
+
+    const std::size_t span =
+        end > begin ? end - begin : 0;
+
+    const std::size_t chunks =
+        span == 0 ? 0 : (span + grainsize - 1) / grainsize;
+
+
+    auto state =
+        std::make_shared<
+            threadpool_detail::ParallelState<void>
+        >();
+
+
+    if(chunks == 0)
+    {
+        state->promise.set_value();
+
+        return state->promise.get_future();
+    }
+
+
+    state->remaining.store(chunks);
+
+
+    for(std::size_t i = 0; i < chunks; ++i)
+    {
+        const std::size_t chunk_begin =
+            begin + i * grainsize;
+
+        const std::size_t chunk_end =
+            chunk_begin + grainsize < end
+                ? chunk_begin + grainsize
+                : end;
+
+
+        this->submit(
+            [this, state, chunk_begin, chunk_end, &f]()
+            {
+                try
+                {
+                    for(std::size_t idx = chunk_begin;
+                        idx < chunk_end;
+                        ++idx)
+                    {
+                        f(idx);
+                    }
+                }
+                catch(...)
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state->mtx
+                    );
+
+                    if(!state->has_ex)
+                    {
+                        state->ex =
+                            std::current_exception();
+
+                        state->has_ex = true;
+                    }
+                }
+
+
+                if(state->remaining.fetch_sub(1) == 1)
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state->mtx
+                    );
+
+                    if(state->has_ex)
+                        state->promise.set_exception(
+                            state->ex
+                        );
+                    else
+                        state->promise.set_value();
+                }
+            }
+        );
+    }
+
+
+    return state->promise.get_future();
+}
+
+
+template <class F>
+std::future<void> ThreadPool::parallel_for(
+    std::size_t begin,
+    std::size_t end,
+    F&& f
+)
+{
+    const std::size_t n =
+        end > begin ? end - begin : 0;
+
+
+    /*
+     * Aim for a few chunks per worker so the load is spread but the
+     * per-chunk overhead stays small.
+     */
+    const std::size_t grainsize =
+        n == 0 ? 1 : (n + 31) / 32;
+
+
+    return parallel_for(
+        begin,
+        end,
+        grainsize,
+        std::forward<F>(f)
+    );
+}
+
+
+// ============================================================
+// parallel_reduce
+// ============================================================
+
+template <class T, class F, class BinOp>
+std::future<T> ThreadPool::parallel_reduce(
+    std::size_t begin,
+    std::size_t end,
+    std::size_t grainsize,
+    T init,
+    F&& f,
+    BinOp&& op
+)
+{
+    if(grainsize == 0)
+        grainsize = 1;
+
+
+    ensure_not_worker("parallel_reduce");
+
+
+    const std::size_t span =
+        end > begin ? end - begin : 0;
+
+    const std::size_t chunks =
+        span == 0 ? 0 : (span + grainsize - 1) / grainsize;
+
+
+    auto state =
+        std::make_shared<
+            threadpool_detail::ParallelState<T>
+        >();
+
+
+    if(chunks == 0)
+    {
+        state->promise.set_value(
+            std::move(init)
+        );
+
+        return state->promise.get_future();
+    }
+
+
+    state->remaining.store(chunks);
+
+    state->acc = std::move(init);
+
+
+    for(std::size_t i = 0; i < chunks; ++i)
+    {
+        const std::size_t chunk_begin =
+            begin + i * grainsize;
+
+        const std::size_t chunk_end =
+            chunk_begin + grainsize < end
+                ? chunk_begin + grainsize
+                : end;
+
+
+        this->submit(
+            [this, state, chunk_begin, chunk_end, &f, &op]()
+            {
+                try
+                {
+                    T partial =
+                        f(
+                            chunk_begin,
+                            chunk_end
+                        );
+
+
+                    std::lock_guard<std::mutex> lock(
+                        state->mtx
+                    );
+
+
+                    if(!state->has_ex)
+                    {
+                        state->acc =
+                            op(
+                                std::move(state->acc),
+                                std::move(partial)
+                            );
+                    }
+                }
+                catch(...)
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state->mtx
+                    );
+
+
+                    if(!state->has_ex)
+                    {
+                        state->ex =
+                            std::current_exception();
+
+                        state->has_ex = true;
+                    }
+                }
+
+
+                if(state->remaining.fetch_sub(1) == 1)
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state->mtx
+                    );
+
+                    if(state->has_ex)
+                        state->promise.set_exception(
+                            state->ex
+                        );
+                    else
+                        state->promise.set_value(
+                            std::move(state->acc)
+                        );
+                }
+            }
+        );
+    }
+
+
+    return state->promise.get_future();
 }
 
 

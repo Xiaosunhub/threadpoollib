@@ -15,6 +15,16 @@ namespace
 
 
     /*
+     * The Worker* (stored as void*) of the worker the current thread is, or
+     * nullptr for a non-worker thread.
+     *
+     * Lets enqueue_task() route a submission made from inside a task back to
+     * that worker's own local queue instead of the shared global queue.
+     */
+    thread_local void* t_worker_self = nullptr;
+
+
+    /*
      * Marks the thread as a worker for the lifetime of the object.
      *
      * RAII rather than a manual reset so that the flag is also cleared on
@@ -22,15 +32,21 @@ namespace
      */
     struct WorkerScope
     {
-        explicit WorkerScope(const ThreadPool* pool)
+        explicit WorkerScope(
+            const ThreadPool* pool,
+            void* self = nullptr
+        )
             : previous_(t_worker_of)
+            , prev_self_(t_worker_self)
         {
             t_worker_of = pool;
+            t_worker_self = self;
         }
 
         ~WorkerScope()
         {
             t_worker_of = previous_;
+            t_worker_self = prev_self_;
         }
 
         WorkerScope(const WorkerScope&) = delete;
@@ -39,6 +55,7 @@ namespace
 
     private:
         const ThreadPool* previous_;
+        void* prev_self_;
     };
 }
 
@@ -422,6 +439,93 @@ std::size_t ThreadPool::discard_tasks_locked(
     }
 
 
+    /*
+     * Deferred (scheduled_) tasks have not started either.
+     *
+     * They are keyed by deadline, so iterate and cancel each one.
+     */
+    for(auto& entry : scheduled_)
+    {
+        Task& t = entry.second;
+
+
+        if(t.state)
+        {
+            TaskState expected =
+                TaskState::WAITING;
+
+
+            t.state->compare_exchange_strong(
+                expected,
+                TaskState::CANCELLED,
+                std::memory_order_acq_rel
+            );
+        }
+
+
+        dropped.emplace_back(
+            std::move(t)
+        );
+    }
+
+    scheduled_.clear();
+
+
+    /*
+     * Per-worker local queues hold nested submissions that have not been
+     * picked up yet.
+     *
+     * Each is owned by exactly one worker, so take that worker's local_mtx
+     * while draining to avoid racing with a task that is mid-submit on the
+     * same worker.
+     */
+    for(auto& worker_ptr : workers_)
+    {
+        Worker& w = *worker_ptr;
+
+
+        std::lock_guard<std::mutex> lk(
+            w.local_mtx
+        );
+
+
+        while(!w.local.empty())
+        {
+            Task t =
+                std::move(
+                    w.local.back()
+                );
+
+            w.local.pop_back();
+
+
+            local_pending_.fetch_sub(
+                1,
+                std::memory_order_relaxed
+            );
+
+
+            if(t.state)
+            {
+                TaskState expected =
+                    TaskState::WAITING;
+
+
+                t.state->compare_exchange_strong(
+                    expected,
+                    TaskState::CANCELLED,
+                    std::memory_order_acq_rel
+                );
+            }
+
+
+            dropped.emplace_back(
+                std::move(t)
+            );
+        }
+    }
+
+
     return dropped.size();
 }
 
@@ -436,6 +540,53 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
     std::function<void()>& reject_cb
 )
 {
+    /*
+     * Route a submission made from inside one of our own tasks back to that
+     * worker's local LIFO queue.
+     *
+     * This is the structural optimization behind 3.0.0: fork-join style
+     * work (parallel_for, parallel_reduce, recursive fan-out) no longer
+     * serializes on the single global mutex. The owning worker is the only
+     * producer and the only consumer, so the contention is gone in the
+     * common case.
+     *
+     * The pool is not marked stopping_ here: a still-running task may
+     * legitimately hand off more work, and stop() drains local queues
+     * itself.
+     */
+    if(t_worker_self != nullptr)
+    {
+        auto* self =
+            static_cast<Worker*>(
+                t_worker_self
+            );
+
+
+        {
+            std::lock_guard<std::mutex> lk(
+                self->local_mtx
+            );
+
+            self->local.push_back(
+                std::move(task)
+            );
+        }
+
+
+        local_pending_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+        submitted_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+        return SubmitResult::ACCEPTED;
+    }
+
+
     std::unique_lock<std::mutex> lock(mtx_);
 
 
@@ -566,6 +717,85 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
 
 
 // ============================================================
+// promote_scheduled_locked
+// ============================================================
+
+void ThreadPool::promote_scheduled_locked()
+{
+    /*
+     * The caller must already hold mtx_.
+     *
+     * Moves every deferred task whose deadline has passed into the
+     * runnable priority queue, preserving its priority and sequence.
+     *
+     * Never called while paused_: the caller guards that, because a paused
+     * pool must not start draining deferred work.
+     */
+    if(scheduled_.empty())
+        return;
+
+
+    const auto now =
+        std::chrono::steady_clock::now();
+
+
+    auto it = scheduled_.begin();
+
+
+    while(it != scheduled_.end()
+        &&
+        it->first <= now)
+    {
+        tasks_.push(
+            std::move(it->second)
+        );
+
+        if(tasks_.size() > peak_queue_)
+            peak_queue_ = tasks_.size();
+
+
+        it = scheduled_.erase(it);
+    }
+}
+
+
+// ============================================================
+// next_scheduled_locked
+// ============================================================
+
+std::chrono::steady_clock::time_point
+    ThreadPool::next_scheduled_locked() const
+{
+    /*
+     * The caller must already hold mtx_.
+     */
+    if(scheduled_.empty())
+        return std::chrono::steady_clock::time_point::max();
+
+
+    return scheduled_.begin()->first;
+}
+
+
+// ============================================================
+// has_due_scheduled_locked
+// ============================================================
+
+bool ThreadPool::has_due_scheduled_locked() const
+{
+    /*
+     * The caller must already hold mtx_.
+     */
+    if(scheduled_.empty())
+        return false;
+
+
+    return scheduled_.begin()->first
+        <= std::chrono::steady_clock::now();
+}
+
+
+// ============================================================
 // worker_loop
 // ============================================================
 
@@ -579,7 +809,10 @@ void ThreadPool::worker_loop(Worker* self)
      * holding its own in-flight slot, and the caller would see a hang with
      * no diagnostic at all.
      */
-    WorkerScope scope(this);
+    WorkerScope scope(
+        this,
+        self
+    );
 
 
     /*
@@ -613,6 +846,72 @@ void ThreadPool::worker_loop(Worker* self)
         Task task;
 
 
+        /*
+         * Local LIFO fast path.
+         *
+         * Tasks submitted from inside a task running on this worker land in
+         * self->local instead of the global queue. The owner is the only
+         * consumer, so this runs lock-free in the steady state and keeps
+         * fork-join patterns (parallel_for, parallel_reduce, recursive
+         * fan-out) off the shared mutex.
+         */
+        {
+            std::lock_guard<std::mutex> lk(
+                self->local_mtx
+            );
+
+            if(!self->local.empty())
+            {
+                task =
+                    std::move(
+                        self->local.back()
+                    );
+
+                self->local.pop_back();
+            }
+        }
+
+        if(task.func)
+        {
+            const std::size_t remaining =
+                local_pending_.fetch_sub(
+                    1,
+                    std::memory_order_relaxed
+                ) - 1;
+
+            run_task(task);
+
+            /*
+             * The fast path never takes the global lock while running, so
+             * wait() / wait_for() (which count local_pending_) would never
+             * be woken once the last local task drains.
+             *
+             * Notify only when this was the final local task: any work
+             * still sitting in tasks_ / inflight_ / scheduled_ is already
+             * covered by the notify in the global cleanup path.
+             */
+            if(remaining == 0)
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+
+                if(inflight_ == 0
+                    &&
+                    tasks_.empty()
+                    &&
+                    scheduled_.empty()
+                    &&
+                    local_pending_.load(
+                        std::memory_order_relaxed
+                    ) == 0)
+                {
+                    cv_idle_.notify_all();
+                }
+            }
+
+            continue;
+        }
+
+
         {
             std::unique_lock<std::mutex> lock(mtx_);
 
@@ -621,6 +920,33 @@ void ThreadPool::worker_loop(Worker* self)
 
 
             bool timed_out = false;
+
+
+            /*
+             * Idle workers wait either for the idle-timeout or for the
+             * next scheduled deadline, whichever comes first. Computing the
+             * deadline lets a worker that is merely holding space for a
+             * future task wake up exactly when that task becomes runnable.
+             */
+            auto deadline =
+                std::chrono::steady_clock::time_point::max();
+
+
+            if(!paused_)
+            {
+                deadline =
+                    std::chrono::steady_clock::now()
+                        + cfg_.idle_timeout;
+
+                if(!scheduled_.empty())
+                {
+                    auto next =
+                        scheduled_.begin()->first;
+
+                    if(next < deadline)
+                        deadline = next;
+                }
+            }
 
 
             if(paused_)
@@ -644,16 +970,18 @@ void ThreadPool::worker_loop(Worker* self)
             else
             {
                 timed_out =
-                    !cv_task_.wait_for(
+                    !cv_task_.wait_until(
                         lock,
-                        cfg_.idle_timeout,
+                        deadline,
                         [this]()
                         {
                             return stopping_
                                 ||
                                 (!paused_
                                     &&
-                                    !tasks_.empty());
+                                    (!tasks_.empty()
+                                        ||
+                                        has_due_scheduled_locked()));
                         }
                     );
             }
@@ -719,11 +1047,14 @@ void ThreadPool::worker_loop(Worker* self)
             /*
              * GRACEFUL shutdown:
              *
-             * Exit only after all queued tasks have been consumed.
+             * Exit only after all queued tasks AND all scheduled (not yet
+             * due) tasks have been consumed.
              */
             if(stopping_
                 &&
-                tasks_.empty())
+                tasks_.empty()
+                &&
+                scheduled_.empty())
             {
                 mark_exit_locked();
 
@@ -737,6 +1068,14 @@ void ThreadPool::worker_loop(Worker* self)
              */
             if(paused_)
                 continue;
+
+
+            /*
+             * Pull any deferred task whose deadline has arrived into the
+             * runnable priority queue. Skipped while paused: a paused pool
+             * must not start draining scheduled work.
+             */
+            promote_scheduled_locked();
 
 
             /*
@@ -832,7 +1171,13 @@ void ThreadPool::worker_loop(Worker* self)
 
             if(inflight_ == 0
                 &&
-                tasks_.empty())
+                tasks_.empty()
+                &&
+                scheduled_.empty()
+                &&
+                local_pending_.load(
+                    std::memory_order_relaxed
+                ) == 0)
             {
                 /*
                  * Wake every thread waiting in wait() / wait_for().
@@ -936,7 +1281,13 @@ void ThreadPool::wait()
         {
             return tasks_.empty()
                 &&
-                inflight_ == 0;
+                inflight_ == 0
+                &&
+                scheduled_.empty()
+                &&
+                local_pending_.load(
+                    std::memory_order_relaxed
+                ) == 0;
         }
     );
 }
@@ -1155,7 +1506,15 @@ PoolMetrics ThreadPool::get_metrics() const
             cfg_.max_threads;
 
         metrics.active =
-            inflight_ + tasks_.size();
+            inflight_
+                + tasks_.size()
+                + scheduled_.size()
+                + local_pending_.load(
+                    std::memory_order_relaxed
+                );
+
+        metrics.scheduled =
+            scheduled_.size();
 
         metrics.peak_queue =
             peak_queue_;
