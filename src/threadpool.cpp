@@ -1672,3 +1672,81 @@ void ThreadPool::set_reject_policy(
 
     cfg_.reject = policy;
 }
+
+
+// ============================================================
+// set_batch_size
+// ============================================================
+
+void ThreadPool::set_batch_size(
+    std::size_t batch_size
+)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+
+    /* Values below 1 are treated as 1 (see Config::batch_size). */
+    cfg_.batch_size = batch_size < 1 ? 1 : batch_size;
+}
+
+
+// ============================================================
+// queue_size
+// ============================================================
+
+std::size_t ThreadPool::queue_size() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+
+    return tasks_.size();
+}
+
+
+// ============================================================
+// scheduled_count
+// ============================================================
+
+std::size_t ThreadPool::scheduled_count() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+
+    return scheduled_.size();
+}
+
+
+// ============================================================
+// worker_count
+// ============================================================
+
+std::size_t ThreadPool::worker_count() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+
+    return workers_.size();
+}
+
+
+// ============================================================
+// active_count
+// ============================================================
+
+std::size_t ThreadPool::active_count() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+
+
+    std::size_t local = 0;
+
+
+    for(const auto& w : workers_)
+        local += w->local.size();
+
+
+    return tasks_.size()
+        + local
+        + scheduled_.size()
+        + inflight_;
+}

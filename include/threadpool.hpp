@@ -32,9 +32,9 @@
  */
 #define THREADPOOL_VERSION_MAJOR 3
 #define THREADPOOL_VERSION_MINOR 0
-#define THREADPOOL_VERSION_PATCH 0
+#define THREADPOOL_VERSION_PATCH 1
 
-#define THREADPOOL_VERSION_STRING "3.0.0"
+#define THREADPOOL_VERSION_STRING "3.0.1"
 
 
 enum class PoolStopMode
@@ -675,6 +675,47 @@ public:
     void set_reject_policy(
         RejectPolicy policy
     );
+
+
+    /**
+     * Change the task batch size at runtime.
+     *
+     * Controls how many tasks a worker pulls out of the queue per critical
+     * section. A larger value amortizes mutex cost over many tiny tasks at
+     * the expense of poorer priority/fairness; smaller keeps latency low.
+     *
+     * Values below 1 are treated as 1. Takes effect on the next wakeup,
+     * so the pool need not be restarted to retune throughput.
+     */
+    void set_batch_size(
+        std::size_t batch_size
+    );
+
+
+    /**
+     * Number of runnable tasks waiting in the global queue (excludes
+     * per-worker local queues and not-yet-due scheduled tasks).
+     */
+    std::size_t queue_size() const;
+
+
+    /**
+     * Number of scheduled tasks that are enqueued but not yet due.
+     */
+    std::size_t scheduled_count() const;
+
+
+    /**
+     * Number of live worker threads currently owned by the pool.
+     */
+    std::size_t worker_count() const;
+
+
+    /**
+     * Number of tasks either running on a worker or sitting in a queue
+     * (global + local + scheduled) that have not completed yet.
+     */
+    std::size_t active_count() const;
 
 
 private:

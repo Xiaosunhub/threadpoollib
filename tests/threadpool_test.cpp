@@ -1403,6 +1403,104 @@ static void test_scheduled_and_parallel()
 }
 
 
+// ------------------------------------------------------------
+// Runtime batch_size tuning + lightweight accessors
+// ------------------------------------------------------------
+
+static void test_runtime_batch_and_accessors()
+{
+    using namespace std::chrono_literals;
+
+    /* queue_size / worker_count / active_count accounting. */
+    {
+        ThreadPool::Config cfg = make_config();
+        cfg.min_threads = 1;
+        cfg.max_threads = 1;
+        cfg.max_queue = 1024;
+        ThreadPool pool(cfg);
+
+        std::promise<void> release;
+        std::future<void> blocker = release.get_future();
+        std::promise<void> started;
+        std::future<void> started_f = started.get_future();
+
+        pool.submit(
+            [&blocker, &started]()
+            {
+                started.set_value();
+                blocker.wait();
+            }
+        );
+
+        /* Ensure the worker is genuinely inside blocker.wait() before we
+         * queue anything, otherwise the blocker task itself could still be
+         * sitting in the global queue and skew queue_size(). */
+        started_f.wait();
+
+        /* Queue a handful of runnable tasks behind the blocker. */
+        for(int i = 0; i < 5; ++i)
+            pool.submit([](){});
+
+        expect(
+            pool.queue_size() == 5,
+            "queue_size reflects the waiting runnable tasks"
+        );
+
+        expect(
+            pool.worker_count() == 1,
+            "worker_count matches the single worker"
+        );
+
+        expect(
+            pool.active_count() >= 6,
+            "active_count counts the running plus queued tasks"
+        );
+
+        release.set_value();
+        blocker.wait();
+        pool.wait();
+
+        expect(
+            pool.queue_size() == 0,
+            "queue_size drains to zero after wait"
+        );
+    }
+
+    /* scheduled_count tracks not-yet-due scheduled tasks. */
+    {
+        ThreadPool pool(make_config());
+
+        pool.submit_after(2s, [](){ return 1; });
+        pool.submit_after(2s, [](){ return 2; });
+
+        expect(
+            pool.scheduled_count() == 2,
+            "scheduled_count reflects enqueued but not-yet-due tasks"
+        );
+
+        /* The futures are intentionally left unobserved; the pool drops
+         * not-yet-due scheduled tasks on shutdown, so teardown is clean. */
+    }
+
+    /* set_batch_size updates the config and clamps values < 1 to 1. */
+    {
+        ThreadPool pool(make_config());
+
+        pool.set_batch_size(16);
+        expect(
+            pool.get_config().batch_size == 16,
+            "set_batch_size stores the new value"
+        );
+
+        pool.set_batch_size(0);
+        expect(
+            pool.get_config().batch_size == 1,
+            "set_batch_size clamps values below 1 to 1"
+        );
+    }
+}
+
+
 int main()
 {
     test_basics();
@@ -1428,6 +1526,8 @@ int main()
     test_runtime_config();
 
     test_scheduled_and_parallel();
+
+    test_runtime_batch_and_accessors();
 
 
     std::printf(
