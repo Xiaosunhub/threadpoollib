@@ -32,9 +32,9 @@
  */
 #define THREADPOOL_VERSION_MAJOR 3
 #define THREADPOOL_VERSION_MINOR 0
-#define THREADPOOL_VERSION_PATCH 1
+#define THREADPOOL_VERSION_PATCH 2
 
-#define THREADPOOL_VERSION_STRING "3.0.1"
+#define THREADPOOL_VERSION_STRING "3.0.2"
 
 
 enum class PoolStopMode
@@ -1021,7 +1021,7 @@ private:
      * Without it, wait() could return right after a worker popped the last
      * task but before that task actually ran.
      */
-    std::size_t inflight_ = 0;
+    std::atomic<std::size_t> inflight_{0};
 
 
     /*
@@ -1288,7 +1288,9 @@ bool ThreadPool::wait_for(
         {
             return tasks_.empty()
                 &&
-                inflight_ == 0
+                inflight_.load(
+                    std::memory_order_relaxed
+                ) == 0
                 &&
                 scheduled_.empty()
                 &&
@@ -1325,7 +1327,9 @@ bool ThreadPool::wait_until(
         {
             return tasks_.empty()
                 &&
-                inflight_ == 0
+                inflight_.load(
+                    std::memory_order_relaxed
+                ) == 0
                 &&
                 scheduled_.empty()
                 &&

@@ -700,16 +700,28 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
 
 
     /*
-     * Wake one worker, but only if one is actually waiting.
+     * Decide whether a wakeup is warranted while we still hold the lock.
      *
-     * When every worker is busy executing a task, it revisits the queue as
-     * soon as it finishes, so a notify would be a pointless syscall -
-     * several hundred thousand of them per second under load.
+     * Wake one worker only if one is actually waiting: when every worker
+     * is busy executing a task, it revisits the queue as soon as it
+     * finishes, so a notify would be a pointless syscall - several hundred
+     * thousand of them per second under load.
      */
-    if(idle_count_ > 0)
-    {
+    const bool wake = (idle_count_ > 0);
+
+
+    /*
+     * Release the lock before the syscall.
+     *
+     * A thread that is woken while the mutex is still held would
+     * immediately block again on it, which both wastes a context switch
+     * and extends the critical section seen by every other submitter.
+     */
+    lock.unlock();
+
+
+    if(wake)
         cv_task_.notify_one();
-    }
 
 
     return SubmitResult::ACCEPTED;
@@ -894,7 +906,9 @@ void ThreadPool::worker_loop(Worker* self)
             {
                 std::lock_guard<std::mutex> lk(mtx_);
 
-                if(inflight_ == 0
+                if(inflight_.load(
+                    std::memory_order_relaxed
+                ) == 0
                     &&
                     tasks_.empty()
                     &&
@@ -1157,32 +1171,49 @@ void ThreadPool::worker_loop(Worker* self)
 
 
             /*
-             * Clear before locking: destructors of captured objects must
+             * Clear before releasing: destructors of captured objects must
              * not run under the mutex.
              */
             batch.clear();
 
 
-            std::lock_guard<std::mutex> lock(mtx_);
+            /*
+             * Account for completion without the global mutex in the common
+             * case.
+             *
+             * Only the transition of inflight_ to zero needs the lock: that
+             * is the only moment wait()'s predicate can flip to "all done",
+             * and the lock makes the check of the queues authoritative so a
+             * wakeup is never lost.
+             *
+             * With the default batch_size of 1 this removes one mutex
+             * acquire/release per completed task from the hot path.
+             */
+            const std::size_t now_inflight =
+                inflight_.fetch_sub(
+                    finished,
+                    std::memory_order_acq_rel
+                ) - finished;
 
 
-            inflight_ -= finished;
-
-
-            if(inflight_ == 0
-                &&
-                tasks_.empty()
-                &&
-                scheduled_.empty()
-                &&
-                local_pending_.load(
-                    std::memory_order_relaxed
-                ) == 0)
+            if(now_inflight == 0)
             {
-                /*
-                 * Wake every thread waiting in wait() / wait_for().
-                 */
-                cv_idle_.notify_all();
+                std::lock_guard<std::mutex> lock(mtx_);
+
+
+                if(tasks_.empty()
+                    &&
+                    scheduled_.empty()
+                    &&
+                    local_pending_.load(
+                        std::memory_order_relaxed
+                    ) == 0)
+                {
+                    /*
+                     * Wake every thread waiting in wait() / wait_for().
+                     */
+                    cv_idle_.notify_all();
+                }
             }
         }
     }
@@ -1281,7 +1312,9 @@ void ThreadPool::wait()
         {
             return tasks_.empty()
                 &&
-                inflight_ == 0
+                inflight_.load(
+                    std::memory_order_relaxed
+                ) == 0
                 &&
                 scheduled_.empty()
                 &&
@@ -1506,7 +1539,9 @@ PoolMetrics ThreadPool::get_metrics() const
             cfg_.max_threads;
 
         metrics.active =
-            inflight_
+            inflight_.load(
+                std::memory_order_relaxed
+            )
                 + tasks_.size()
                 + scheduled_.size()
                 + local_pending_.load(
@@ -1748,5 +1783,7 @@ std::size_t ThreadPool::active_count() const
     return tasks_.size()
         + local
         + scheduled_.size()
-        + inflight_;
+        + inflight_.load(
+            std::memory_order_relaxed
+        );
 }

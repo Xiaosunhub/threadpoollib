@@ -1501,6 +1501,74 @@ static void test_runtime_batch_and_accessors()
 }
 
 
+// ------------------------------------------------------------
+// Concurrency stress: lock-free completion accounting must not
+// lose a wakeup (wait() must not deadlock)
+// ------------------------------------------------------------
+
+static void test_wait_stress()
+{
+    using namespace std::chrono_literals;
+
+    ThreadPool pool(make_config());
+
+    std::atomic<std::uint64_t> done{0};
+
+    /*
+     * Several external producers hammer submit() + get() while a separate
+     * thread calls wait(). This exercises the path where inflight_ ticks
+     * down to zero lock-free; a lost wakeup would hang the waiter.
+     */
+    const int producer_count = 4;
+    const std::uint64_t per = 20000;
+
+    std::vector<std::thread> producers;
+    producers.reserve(producer_count);
+
+    for(int p = 0; p < producer_count; ++p)
+    {
+        producers.emplace_back(
+            [&pool, &done, per]()
+            {
+                for(std::uint64_t i = 0; i < per; ++i)
+                {
+                    pool.submit(
+                        [&done]()
+                        {
+                            done.fetch_add(
+                                1,
+                                std::memory_order_relaxed
+                            );
+                        }
+                    ).get();
+                }
+            }
+        );
+    }
+
+    std::thread waiter(
+        [&pool]()
+        {
+            pool.wait();
+        }
+    );
+
+    for(auto& t : producers)
+        t.join();
+
+    waiter.join();
+
+    /* Authoritative re-check once everything has been submitted. */
+    pool.wait();
+
+    expect(
+        done.load()
+            == static_cast<std::uint64_t>(producer_count) * per,
+        "all stress tasks executed without a lost wakeup"
+    );
+}
+
+
 int main()
 {
     test_basics();
@@ -1528,6 +1596,8 @@ int main()
     test_scheduled_and_parallel();
 
     test_runtime_batch_and_accessors();
+
+    test_wait_stress();
 
 
     std::printf(
