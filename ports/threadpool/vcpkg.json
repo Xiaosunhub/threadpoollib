@@ -1,7 +1,7 @@
 {
   "name": "threadpool",
-  "version": "3.1.1",
-  "description": "A lightweight C++17 dynamic thread pool with priority tasks, cancellation and metrics.",
+  "version": "4.0.0",
+  "description": "A lightweight C++17 dynamic thread pool with priority tasks, cancellation, work-stealing and metrics.",
   "homepage": "https://github.com/Xiaosunhub/threadpoollib",
   "license": "MIT",
   "dependencies": [

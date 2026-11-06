@@ -30,12 +30,19 @@
  * wait_until() and the expanded PoolMetrics only exist from 2.1.0 on;
  * scheduling (submit_at / submit_after), parallel_for / parallel_reduce
  * and per-worker local queues arrive with 3.0.0.
+ *
+ * 4.0.0 is a scheduler rewrite: each worker owns a work-stealing deque, so
+ * fork-join backlogs (nested submit / parallel_for / parallel_reduce tails)
+ * are balanced across idle workers instead of being pinned to the producer.
+ * It also adds future composition (when_all / when_any) and a process-wide
+ * default_pool() for fire-and-forget use. The stolen counter in
+ * PoolMetrics is new in 4.0.0.
  */
-#define THREADPOOL_VERSION_MAJOR 3
-#define THREADPOOL_VERSION_MINOR 1
-#define THREADPOOL_VERSION_PATCH 1
+#define THREADPOOL_VERSION_MAJOR 4
+#define THREADPOOL_VERSION_MINOR 0
+#define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "3.1.1"
+#define THREADPOOL_VERSION_STRING "4.0.0"
 
 
 enum class PoolStopMode
@@ -211,6 +218,14 @@ struct PoolMetrics
     std::uint64_t cancelled = 0;
     std::uint64_t rejected = 0;
     std::uint64_t running = 0;
+
+    /*
+     * Tasks taken by an idle worker from a peer's deque.
+     *
+     * A non-zero value shows the 4.0.0 work-stealing scheduler is actually
+     * load-balancing fork-join work rather than leaving it on the producer.
+     */
+    std::uint64_t stolen = 0;
 
 
     /*
@@ -719,6 +734,268 @@ public:
     std::size_t active_count() const;
 
 
+    // ============================================================
+    // Future composition (4.0.0)
+    // ============================================================
+
+    /**
+     * Wait for every future in the input to complete, then return their
+     * results as a vector in the same order.
+     *
+     * The aggregation itself runs as a task on this pool, so it does not
+     * block the calling thread.
+     */
+    template <class T>
+    std::future<std::vector<T>> when_all(
+        std::vector<std::future<T>> futures
+    )
+    {
+        /*
+         * The input is held by shared_ptr rather than moved straight into
+         * the lambda: std::packaged_task requires its callable to be
+         * copyable, and a lambda that owns a vector of (move-only) futures
+         * is not. A shared_ptr keeps the closure copyable.
+         */
+        auto futs =
+            std::make_shared<
+                std::vector<std::future<T>>
+            >(std::move(futures));
+
+        return submit(
+            [futs]()
+            {
+                std::vector<T> out;
+
+                out.reserve(futs->size());
+
+                for(auto& f : *futs)
+                    out.push_back(f.get());
+
+                return out;
+            }
+        );
+    }
+
+
+    /**
+     * void specialization of when_all(): waits for every future, then
+     * returns once all of them have completed (or thrown).
+     */
+    std::future<void> when_all(
+        std::vector<std::future<void>> futures
+    )
+    {
+        auto futs =
+            std::make_shared<
+                std::vector<std::future<void>>
+            >(std::move(futures));
+
+        return submit(
+            [futs]()
+            {
+                for(auto& f : *futs)
+                    f.get();
+            }
+        );
+    }
+
+
+    /**
+     * Wait for the first future in the input to finish (successfully or by
+     * throwing), then return its index together with its result.
+     *
+     * Only the first finisher is reported; exceptions from the others are
+     * swallowed (they are still safe to ignore because each is observed by
+     * its own internally spawned task).
+     */
+    template <class T>
+    std::future<std::pair<std::size_t, T>> when_any(
+        std::vector<std::future<T>> futures
+    )
+    {
+        auto shared =
+            std::make_shared<
+                std::vector<std::shared_future<T>>
+            >();
+
+        shared->reserve(futures.size());
+
+        for(auto& f : futures)
+            shared->push_back(f.share());
+
+
+        auto result_p =
+            std::make_shared<
+                std::promise<std::pair<std::size_t, T>>
+            >();
+
+        auto result_f = result_p->get_future();
+
+        auto claimed =
+            std::make_shared<std::atomic<bool>>(false);
+
+
+        const std::size_t n = shared->size();
+
+        if(n == 0)
+        {
+            result_p->set_exception(
+                std::make_exception_ptr(
+                    std::runtime_error(
+                        "ThreadPool::when_any: empty input"
+                    )
+                )
+            );
+
+            return result_f;
+        }
+
+
+        for(std::size_t i = 0; i < n; ++i)
+        {
+            submit(
+                [shared, result_p, claimed, i]() mutable
+                {
+                    try
+                    {
+                        T v = (*shared)[i].get();
+
+                        bool expected = false;
+
+                        if(claimed->compare_exchange_strong(
+                            expected,
+                            true
+                        ))
+                        {
+                            result_p->set_value(
+                                {i, std::move(v)}
+                            );
+                        }
+                    }
+                    catch(...)
+                    {
+                        bool expected = false;
+
+                        if(claimed->compare_exchange_strong(
+                            expected,
+                            true
+                        ))
+                        {
+                            result_p->set_exception(
+                                std::current_exception()
+                            );
+                        }
+                    }
+                }
+            );
+        }
+
+
+        return result_f;
+    }
+
+
+    /**
+     * void specialization of when_any(): waits for the first future to
+     * finish, then returns its index.
+     */
+    std::future<std::size_t> when_any(
+        std::vector<std::future<void>> futures
+    )
+    {
+        auto shared =
+            std::make_shared<
+                std::vector<std::shared_future<void>>
+            >();
+
+        shared->reserve(futures.size());
+
+        for(auto& f : futures)
+            shared->push_back(f.share());
+
+
+        auto result_p =
+            std::make_shared<std::promise<std::size_t>>();
+
+        auto result_f = result_p->get_future();
+
+        auto claimed =
+            std::make_shared<std::atomic<bool>>(false);
+
+
+        const std::size_t n = shared->size();
+
+        if(n == 0)
+        {
+            result_p->set_exception(
+                std::make_exception_ptr(
+                    std::runtime_error(
+                        "ThreadPool::when_any: empty input"
+                    )
+                )
+            );
+
+            return result_f;
+        }
+
+
+        for(std::size_t i = 0; i < n; ++i)
+        {
+            submit(
+                [shared, result_p, claimed, i]() mutable
+                {
+                    try
+                    {
+                        (*shared)[i].get();
+
+                        bool expected = false;
+
+                        if(claimed->compare_exchange_strong(
+                            expected,
+                            true
+                        ))
+                        {
+                            result_p->set_value(i);
+                        }
+                    }
+                    catch(...)
+                    {
+                        bool expected = false;
+
+                        if(claimed->compare_exchange_strong(
+                            expected,
+                            true
+                        ))
+                        {
+                            result_p->set_exception(
+                                std::current_exception()
+                            );
+                        }
+                    }
+                }
+            );
+        }
+
+
+        return result_f;
+    }
+
+
+    /**
+     * Process-wide pool for quick fire-and-forget submission.
+     *
+     * Lazily created on first use (thread-safe magic static) and torn down
+     * at program exit via a graceful stop. Prefer a dedicated pool when you
+     * need to tune the thread count, idle timeout or rejection policy.
+     */
+    static ThreadPool& default_pool()
+    {
+        static ThreadPool pool(Config{});
+
+        return pool;
+    }
+
+
 private:
 
     struct Task
@@ -817,15 +1094,96 @@ private:
      * The owning worker is the only producer and the only consumer, so the
      * mutex is uncontended in the common case.
      */
+    /*
+     * A double-ended task buffer owned by one worker.
+     *
+     * The owner pushes and pops from the back (LIFO), which keeps a
+     * worker's own fork-join tree cache-friendly. Idle peers steal from the
+     * front (FIFO) so a backlog is drained oldest-first and spread evenly.
+     *
+     * The mutex makes this safe for one owner + many thieves. A fully
+     * lock-free Chase-Lev deque would be faster on paper, but the lock is
+     * uncontended on the owner side (the common path) and only ever taken
+     * briefly by a thief, so the simpler design gives the same scaling
+     * without the ABA hazards.
+     */
+    struct WorkStealingDeque
+    {
+        void push(Task t)
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            q_.push_back(std::move(t));
+        }
+
+
+        /*
+         * Owner side: take the most recently pushed task.
+         */
+        bool pop(Task& out)
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            if(q_.empty())
+                return false;
+
+            out = std::move(q_.back());
+            q_.pop_back();
+
+            return true;
+        }
+
+
+        /*
+         * Thief side: take the oldest task.
+         */
+        bool steal(Task& out)
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            if(q_.empty())
+                return false;
+
+            out = std::move(q_.front());
+            q_.pop_front();
+
+            return true;
+        }
+
+
+        bool empty() const
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            return q_.empty();
+        }
+
+
+        std::size_t size() const
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            return q_.size();
+        }
+
+
+        mutable std::mutex mtx_;
+
+        std::deque<Task> q_;
+    };
+
+
     struct Worker
     {
         std::thread thread;
 
         std::atomic<bool> finished{false};
 
-        std::mutex local_mtx;
-
-        std::deque<Task> local;
+        /*
+         * The worker's own task buffer. Nested submissions (submit() called
+         * from inside a task) land here; idle peers reach in to steal.
+         */
+        WorkStealingDeque deque_;
     };
 
 
@@ -933,6 +1291,32 @@ private:
     void worker_loop(Worker* self);
 
     /*
+     * Snapshot the worker list under mtx_, then try to steal one task from
+     * a peer's deque (skipping self). Returns true and fills out on success.
+     *
+     * Called WITHOUT mtx_ held: the snapshot keeps every candidate Worker
+     * alive (workers_ now holds shared_ptr) so a victim that is reaped and
+     * joined while we are stealing from it cannot be a dangling pointer.
+     */
+    bool try_steal(
+        Task& out,
+        Worker* self
+    );
+
+    /*
+     * Account for n tasks finishing: drop them from inflight_ and, if that
+     * brings inflight_ to zero and every queue is empty, release the
+     * threads parked in wait().
+     *
+     * The increment side (in worker_loop) adds to inflight_ BEFORE removing
+     * the task from its deque, so a waiter never sees a task that is in
+     * neither counter.
+     */
+    void complete_tasks(
+        std::size_t n
+    );
+
+    /*
      * Creates the Worker object (and updates the counters) while holding
      * mtx_, but does NOT start the OS thread. The caller spawns it outside
      * the lock via spawn_worker() so that thread creation never blocks
@@ -948,7 +1332,7 @@ private:
      * newly created Worker (to be spawned outside the lock), or nullptr.
      */
     Worker* maybe_expand_locked(
-        std::vector<std::unique_ptr<Worker>>& out
+        std::vector<std::shared_ptr<Worker>>& out
     );
 
     /*
@@ -957,7 +1341,7 @@ private:
      * join() - which can block for milliseconds - never stalls the pool.
      */
     void reap_workers_locked(
-        std::vector<std::unique_ptr<Worker>>& out
+        std::vector<std::shared_ptr<Worker>>& out
     );
 
     /*
@@ -1031,10 +1415,16 @@ private:
      * Each entry is heap allocated so that Worker is never reallocated:
      * a running worker hands its own address to the thread entry point.
      *
+     * Held by shared_ptr (not unique_ptr) so a thief that snapshots the
+     * list and then steals from a peer cannot end up with a dangling
+     * pointer if that peer is reaped and joined in the meantime. The
+     * refcount keeps the Worker - and its deque_ mutex - alive until the
+     * thief is done.
+     *
      * Entries are removed by reap_workers_locked() once a worker exited.
      */
     std::vector<
-        std::unique_ptr<Worker>
+        std::shared_ptr<Worker>
     > workers_;
 
 
@@ -1118,6 +1508,8 @@ private:
     std::atomic<std::uint64_t> rejected_{0};
 
     std::atomic<std::uint64_t> running_{0};
+
+    std::atomic<std::uint64_t> stolen_{0};
 };
 
 

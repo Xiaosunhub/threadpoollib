@@ -169,7 +169,7 @@ ThreadPool::~ThreadPool()
      * iteration.
      */
     std::vector<
-        std::unique_ptr<Worker>
+        std::shared_ptr<Worker>
     > pending;
 
 
@@ -195,7 +195,7 @@ ThreadPool::~ThreadPool()
 // ============================================================
 
 void ThreadPool::reap_workers_locked(
-    std::vector<std::unique_ptr<Worker>>& out
+    std::vector<std::shared_ptr<Worker>>& out
 )
 {
     /*
@@ -314,9 +314,9 @@ ThreadPool::Worker* ThreadPool::create_worker_locked()
         return nullptr;
 
 
-    workers_.push_back(
-        std::make_unique<Worker>()
-    );
+        workers_.push_back(
+            std::make_shared<Worker>()
+        );
 
 
     Worker* worker = workers_.back().get();
@@ -390,7 +390,7 @@ void ThreadPool::mark_exit_locked()
 // ============================================================
 
 ThreadPool::Worker* ThreadPool::maybe_expand_locked(
-    std::vector<std::unique_ptr<Worker>>& out
+    std::vector<std::shared_ptr<Worker>>& out
 )
 {
     /*
@@ -558,12 +558,12 @@ std::size_t ThreadPool::discard_tasks_locked(
 
 
     /*
-     * Per-worker local queues hold nested submissions that have not been
-     * picked up yet.
+     * Per-worker deques hold nested submissions that have not been picked up
+     * yet (and any backlog an idle peer has not stolen).
      *
-     * Each is owned by exactly one worker, so take that worker's local_mtx
-     * while draining to avoid racing with a task that is mid-submit on the
-     * same worker.
+     * Each deque is owned by exactly one worker, so take that worker's deque
+     * mutex while draining to avoid racing with a task that is mid-submit on
+     * the same worker, or with a peer that is mid-steal.
      */
     for(auto& worker_ptr : workers_)
     {
@@ -571,18 +571,18 @@ std::size_t ThreadPool::discard_tasks_locked(
 
 
         std::lock_guard<std::mutex> lk(
-            w.local_mtx
+            w.deque_.mtx_
         );
 
 
-        while(!w.local.empty())
+        while(!w.deque_.q_.empty())
         {
             Task t =
                 std::move(
-                    w.local.back()
+                    w.deque_.q_.back()
                 );
 
-            w.local.pop_back();
+            w.deque_.q_.pop_back();
 
 
             local_pending_.fetch_sub(
@@ -650,10 +650,10 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
 
         {
             std::lock_guard<std::mutex> lk(
-                self->local_mtx
+                self->deque_.mtx_
             );
 
-            self->local.push_back(
+            self->deque_.q_.push_back(
                 std::move(task)
             );
         }
@@ -668,6 +668,13 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
             1,
             std::memory_order_relaxed
         );
+
+        /*
+         * An idle peer is parked in worker_loop(). Wake one so it can come
+         * and steal the backlog we just created, instead of waiting out its
+         * full idle timeout before noticing the work.
+         */
+        cv_task_.notify_one();
 
         return SubmitResult::ACCEPTED;
     }
@@ -791,7 +798,7 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
      * maybe_expand_locked() returns a freshly created Worker (to be started
      * outside the lock) and reaps exited ones into to_join.
      */
-    std::vector<std::unique_ptr<Worker>> to_join;
+    std::vector<std::shared_ptr<Worker>> to_join;
 
     Worker* new_worker =
         maybe_expand_locked(to_join);
@@ -995,68 +1002,83 @@ void ThreadPool::worker_loop(Worker* self)
 
 
         /*
-         * Local LIFO fast path.
+         * 1. Own deque, LIFO fast path.
          *
          * Tasks submitted from inside a task running on this worker land in
-         * self->local instead of the global queue. The owner is the only
-         * consumer, so this runs lock-free in the steady state and keeps
+         * self->deque_ instead of the global queue. The owner is the only
+         * producer, so this runs lock-free in the steady state and keeps
          * fork-join patterns (parallel_for, parallel_reduce, recursive
          * fan-out) off the shared mutex.
          */
         {
             std::lock_guard<std::mutex> lk(
-                self->local_mtx
+                self->deque_.mtx_
             );
 
-            if(!self->local.empty())
+            if(!self->deque_.q_.empty())
             {
                 task =
                     std::move(
-                        self->local.back()
+                        self->deque_.q_.back()
                     );
 
-                self->local.pop_back();
+                self->deque_.q_.pop_back();
             }
         }
 
         if(task.func)
         {
-            const std::size_t remaining =
-                local_pending_.fetch_sub(
-                    1,
-                    std::memory_order_relaxed
-                ) - 1;
+            /*
+             * Count it as in-flight BEFORE removing it from the deque
+             * counter, so a waiter never observes a moment where the task is
+             * in neither counter (which would let wait() return early).
+             */
+            inflight_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+            local_pending_.fetch_sub(
+                1,
+                std::memory_order_relaxed
+            );
 
             run_task(task);
 
-            /*
-             * The fast path never takes the global lock while running, so
-             * wait() / wait_for() (which count local_pending_) would never
-             * be woken once the last local task drains.
-             *
-             * Notify only when this was the final local task: any work
-             * still sitting in tasks_ / inflight_ / scheduled_ is already
-             * covered by the notify in the global cleanup path.
-             */
-            if(remaining == 0)
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
+            complete_tasks(1);
 
-                if(inflight_.load(
-                    std::memory_order_relaxed
-                ) == 0
-                    &&
-                    tasks_.empty()
-                    &&
-                    scheduled_.empty()
-                    &&
-                    local_pending_.load(
-                        std::memory_order_relaxed
-                    ) == 0)
-                {
-                    cv_idle_.notify_all();
-                }
-            }
+            continue;
+        }
+
+
+        /*
+         * 2. Steal from a peer's deque (FIFO end).
+         *
+         * This is the 4.0.0 load balancer: an idle worker that finds the
+         * global queue empty pulls fork-join backlog off a busy peer
+         * instead of going to sleep, so long tails do not stall on one
+         * thread.
+         */
+        if(try_steal(task, self))
+        {
+            inflight_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+            local_pending_.fetch_sub(
+                1,
+                std::memory_order_relaxed
+            );
+
+            stolen_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+            run_task(task);
+
+            complete_tasks(1);
 
             continue;
         }
@@ -1131,7 +1153,11 @@ void ThreadPool::worker_loop(Worker* self)
                                     &&
                                     (!tasks_.empty()
                                         ||
-                                        has_due_scheduled_locked()));
+                                        has_due_scheduled_locked()
+                                        ||
+                                        local_pending_.load(
+                                            std::memory_order_relaxed
+                                        ) > 0));
                         }
                     );
             }
@@ -1229,10 +1255,10 @@ void ThreadPool::worker_loop(Worker* self)
 
 
             /*
-             * Normally, if the condition-variable predicate succeeds,
-             * tasks_ should not be empty.
-             *
-             * Keep this check for defensive robustness.
+             * The predicate may have woken us because a peer deque has
+             * stealable work (local_pending_ > 0) rather than because the
+             * global queue has tasks. In that case there is nothing to pop
+             * here; loop back to the top and let the steal path take it.
              */
             if(!pop_task_locked(task))
                 continue;
@@ -1325,32 +1351,7 @@ void ThreadPool::worker_loop(Worker* self)
              * With the default batch_size of 1 this removes one mutex
              * acquire/release per completed task from the hot path.
              */
-            const std::size_t now_inflight =
-                inflight_.fetch_sub(
-                    finished,
-                    std::memory_order_acq_rel
-                ) - finished;
-
-
-            if(now_inflight == 0)
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
-
-
-                if(tasks_.empty()
-                    &&
-                    scheduled_.empty()
-                    &&
-                    local_pending_.load(
-                        std::memory_order_relaxed
-                    ) == 0)
-                {
-                    /*
-                     * Wake every thread waiting in wait() / wait_for().
-                     */
-                    cv_idle_.notify_all();
-                }
-            }
+            complete_tasks(finished);
         }
     }
 
@@ -1365,6 +1366,95 @@ void ThreadPool::worker_loop(Worker* self)
         true,
         std::memory_order_release
     );
+}
+
+
+// ============================================================
+// try_steal
+// ============================================================
+
+bool ThreadPool::try_steal(
+    Task& out,
+    Worker* self
+)
+{
+    /*
+     * Called WITHOUT mtx_ held.
+     *
+     * Snapshot the worker list under mtx_ (as shared_ptr) so every
+     * candidate Worker - and its deque_ mutex - stays alive for the whole
+     * steal attempt, even if a peer is reaped and joined in the meantime.
+     */
+    std::vector<std::shared_ptr<Worker>> candidates;
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        candidates = workers_;
+    }
+
+
+    for(auto& wp : candidates)
+    {
+        Worker* w = wp.get();
+
+        /*
+         * Never steal from our own deque: that would fight the owner's LIFO
+         * pop and is pointless (we would just take our own work).
+         */
+        if(w == self)
+            continue;
+
+
+        if(w->deque_.steal(out))
+            return true;
+    }
+
+
+    return false;
+}
+
+
+// ============================================================
+// complete_tasks
+// ============================================================
+
+void ThreadPool::complete_tasks(
+    std::size_t n
+)
+{
+    /*
+     * Runs outside of mtx_ in the common case.
+     *
+     * The increment side (worker_loop) adds to inflight_ BEFORE removing
+     * the task from its deque, so a waiter never sees a task in neither
+     * counter. Dropping to zero is the only moment wait()'s predicate can
+     * flip to "all done", and taking the lock there makes the queue check
+     * authoritative so a wakeup is never lost.
+     */
+    const std::size_t now =
+        inflight_.fetch_sub(
+            n,
+            std::memory_order_acq_rel
+        ) - n;
+
+
+    if(now == 0)
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+
+        if(tasks_.empty()
+            &&
+            scheduled_.empty()
+            &&
+            local_pending_.load(
+                std::memory_order_relaxed
+            ) == 0)
+        {
+            cv_idle_.notify_all();
+        }
+    }
 }
 
 
@@ -1723,6 +1813,11 @@ PoolMetrics ThreadPool::get_metrics() const
             std::memory_order_relaxed
         );
 
+    metrics.stolen =
+        stolen_.load(
+            std::memory_order_relaxed
+        );
+
 
     return metrics;
 }
@@ -1779,7 +1874,7 @@ void ThreadPool::resize(
 
     std::vector<Worker*> created;
 
-    std::vector<std::unique_ptr<Worker>> to_join;
+    std::vector<std::shared_ptr<Worker>> to_join;
 
 
     {
@@ -1958,8 +2053,8 @@ std::size_t ThreadPool::active_count() const
     std::size_t local = 0;
 
 
-    for(const auto& w : workers_)
-        local += w->local.size();
+    for(const auto& wp : workers_)
+        local += wp->deque_.size();
 
 
     return tasks_.size()

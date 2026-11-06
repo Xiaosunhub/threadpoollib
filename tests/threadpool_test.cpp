@@ -1678,6 +1678,245 @@ static void test_scaling_churn()
 }
 
 
+// ------------------------------------------------------------
+// 4.0.0: work-stealing scheduler + future composition + default pool
+// ------------------------------------------------------------
+
+static void test_work_stealing_and_composition()
+{
+    using namespace std::chrono_literals;
+
+    /*
+     * Work-stealing: a fork-join backlog created on one worker must be
+     * drained by an idle peer rather than stalling on the producer.
+     */
+    {
+        ThreadPool::Config cfg = make_config();
+
+        cfg.min_threads = 2;
+        cfg.max_threads = 2;
+        cfg.idle_timeout = 500ms;
+
+        ThreadPool pool(cfg);
+
+        std::atomic<int> nested{0};
+
+        pool.submit(
+            [&pool, &nested]()
+            {
+                for(int i = 0; i < 500; ++i)
+                {
+                    pool.submit(
+                        [&nested]()
+                        {
+                            sleep_ms(2);
+
+                            nested.fetch_add(
+                                1,
+                                std::memory_order_relaxed
+                            );
+                        }
+                    );
+                }
+            }
+        ).get();
+
+        pool.wait();
+
+        expect(
+            nested.load() == 500,
+            "nested fork-join tasks all complete"
+        );
+
+        expect(
+            pool.get_metrics().stolen > 0,
+            "idle worker stole the fork-join backlog (stealing active)"
+        );
+    }
+
+    /* when_all collects every result in submission order. */
+    {
+        ThreadPool pool(make_config());
+
+        std::vector<std::future<int>> futs;
+
+        for(int i = 1; i <= 4; ++i)
+            futs.push_back(
+                pool.submit([i]()
+                {
+                    return i * i;
+                })
+            );
+
+        auto all = pool.when_all(
+            std::move(futs)
+        ).get();
+
+        std::vector<int> expected{1, 4, 9, 16};
+
+        expect(
+            all == expected,
+            "when_all returns results in submission order"
+        );
+    }
+
+    /* when_all(void) waits for every task to finish. */
+    {
+        ThreadPool pool(make_config());
+
+        std::atomic<int> count{0};
+
+        std::vector<std::future<void>> futs;
+
+        for(int i = 0; i < 16; ++i)
+            futs.push_back(
+                pool.submit(
+                    [&count]()
+                    {
+                        count.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        );
+                    }
+                )
+            );
+
+        pool.when_all(
+            std::move(futs)
+        ).get();
+
+        expect(
+            count.load() == 16,
+            "when_all(void) waits for every task"
+        );
+    }
+
+    /*
+     * when_any returns as soon as the first future is ready, without
+     * blocking on the delayed ones.
+     */
+    {
+        ThreadPool pool(make_config());
+
+        std::vector<std::future<int>> futs;
+
+        futs.push_back(
+            pool.submit(
+                []()
+                {
+                    return 42;
+                }
+            )
+        );
+
+        futs.push_back(
+            pool.submit_after(
+                250ms,
+                []()
+                {
+                    return 1;
+                }
+            )
+        );
+
+        futs.push_back(
+            pool.submit_after(
+                250ms,
+                []()
+                {
+                    return 2;
+                }
+            )
+        );
+
+        auto start =
+            std::chrono::steady_clock::now();
+
+        auto res = pool.when_any(
+            std::move(futs)
+        ).get();
+
+        auto elapsed =
+            std::chrono::steady_clock::now()
+                - start;
+
+        expect(
+            res.second == 42,
+            "when_any returns the first-ready result"
+        );
+
+        expect(
+            elapsed < 100ms,
+            "when_any does not wait for the delayed futures"
+        );
+    }
+
+    /* when_any(void) reports the index of the first-ready task. */
+    {
+        ThreadPool pool(make_config());
+
+        std::vector<std::future<void>> futs;
+
+        futs.push_back(
+            pool.submit(
+                [](){}
+            )
+        );
+
+        futs.push_back(
+            pool.submit_after(
+                250ms,
+                [](){}
+            )
+        );
+
+        auto start =
+            std::chrono::steady_clock::now();
+
+        auto idx = pool.when_any(
+            std::move(futs)
+        ).get();
+
+        auto elapsed =
+            std::chrono::steady_clock::now()
+                - start;
+
+        expect(
+            idx == 0,
+            "when_any(void) reports the first-ready index"
+        );
+
+        expect(
+            elapsed < 100ms,
+            "when_any(void) does not wait for the delayed task"
+        );
+    }
+
+    /* default_pool is a usable process-wide singleton. */
+    {
+        auto& a = ThreadPool::default_pool();
+        auto& b = ThreadPool::default_pool();
+
+        expect(
+            &a == &b,
+            "default_pool returns the same singleton"
+        );
+
+        auto v = a.submit(
+            []()
+            {
+                return 7;
+            }
+        );
+
+        expect(
+            v.get() == 7,
+            "default_pool executes a submitted task"
+        );
+    }
+}
+
+
 int main()
 {
     test_basics();
@@ -1709,6 +1948,8 @@ int main()
     test_wait_stress();
 
     test_scaling_churn();
+
+    test_work_stealing_and_composition();
 
 
     std::printf(
