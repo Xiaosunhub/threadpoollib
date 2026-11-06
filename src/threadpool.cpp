@@ -95,17 +95,56 @@ ThreadPool::ThreadPool(Config cfg)
     }
 
 
-    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<Worker*> created;
+
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+
+        /*
+         * Cap the ready-queue backing store at max_queue up front so that
+         * pushing under the lock never triggers a reallocation that copies
+         * every surviving element while the pool lock is held.
+         */
+        tasks_.reserve(cfg_.max_queue);
+
+
+        /*
+         * Create the minimum number of resident worker threads.
+         */
+        for(std::size_t i = 0;
+            i < cfg_.min_threads;
+            ++i)
+        {
+            Worker* w = create_worker_locked();
+
+            if(w)
+                created.push_back(w);
+        }
+    }
 
 
     /*
-     * Create the minimum number of resident worker threads.
+     * Start the OS threads outside of any lock.
+     *
+     * A failing spawn (e.g. the system ran out of threads) rolls the
+     * corresponding Worker back under the lock; the others already run.
      */
-    for(std::size_t i = 0;
-        i < cfg_.min_threads;
-        ++i)
+    for(Worker* w : created)
     {
-        create_worker_locked();
+        try
+        {
+            spawn_worker(w);
+        }
+        catch(...)
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            rollback_worker_locked(w);
+
+            throw;
+        }
     }
 }
 
@@ -155,7 +194,9 @@ ThreadPool::~ThreadPool()
 // reap_workers_locked
 // ============================================================
 
-void ThreadPool::reap_workers_locked()
+void ThreadPool::reap_workers_locked(
+    std::vector<std::unique_ptr<Worker>>& out
+)
 {
     /*
      * The caller must already hold mtx_.
@@ -165,8 +206,10 @@ void ThreadPool::reap_workers_locked()
      * stay in workers_ forever and every expansion / shrink cycle would
      * add one more dead entry.
      *
-     * Joining here is safe because a finished worker no longer touches
-     * mtx_.
+     * The thread is NOT joined here: join() can block for milliseconds and
+     * must not run while the pool lock is held (it would stall every other
+     * submitter and every worker waiting on mtx_). The caller joins the
+     * collected Workers outside of the lock.
      */
     for(auto it = workers_.begin();
         it != workers_.end();)
@@ -177,10 +220,9 @@ void ThreadPool::reap_workers_locked()
         if(worker.finished.load(
             std::memory_order_acquire))
         {
-            if(worker.thread.joinable())
-            {
-                worker.thread.join();
-            }
+            out.push_back(
+                std::move(*it)
+            );
 
             it = workers_.erase(it);
 
@@ -195,27 +237,83 @@ void ThreadPool::reap_workers_locked()
 
 
 // ============================================================
-// create_worker_locked
+// spawn_worker
 // ============================================================
 
-void ThreadPool::create_worker_locked()
+void ThreadPool::spawn_worker(
+    Worker* worker
+)
+{
+    /*
+     * Called WITHOUT mtx_ held.
+     *
+     * Moving the OS-thread creation out of the pool lock keeps a burst of
+     * expansions from serializing every other submit on the (sometimes
+     * multi-millisecond) cost of spawning a thread.
+     */
+    worker->thread =
+        std::thread(
+            &ThreadPool::worker_loop,
+            this,
+            worker
+        );
+}
+
+
+// ============================================================
+// rollback_worker_locked
+// ============================================================
+
+void ThreadPool::rollback_worker_locked(
+    Worker* worker
+)
 {
     /*
      * The caller must already hold mtx_.
+     *
+     * Undoes create_worker_locked() when spawn_worker() failed, so the
+     * counters stay consistent and the half-built Worker is reclaimed.
+     */
+    for(auto it = workers_.begin();
+        it != workers_.end();
+        ++it)
+    {
+        if(it->get() == worker)
+        {
+            workers_.erase(it);
+
+            break;
+        }
+    }
+
+
+    --worker_count_;
+
+    --workers_created_;
+}
+
+
+// ============================================================
+// create_worker_locked
+// ============================================================
+
+ThreadPool::Worker* ThreadPool::create_worker_locked()
+{
+    /*
+     * The caller must already hold mtx_.
+     *
+     * Only builds the Worker object and updates the counters. The OS thread
+     * is started afterwards by spawn_worker() outside of the lock.
      */
 
     if(stopping_)
-        return;
+        return nullptr;
 
 
     if(worker_count_ >= cfg_.max_threads)
-        return;
+        return nullptr;
 
 
-    /*
-     * reap_workers_locked() is driven by maybe_expand_locked() so that a
-     * submit pays for it only when a worker actually exited.
-     */
     workers_.push_back(
         std::make_unique<Worker>()
     );
@@ -237,25 +335,7 @@ void ThreadPool::create_worker_locked()
     ++workers_created_;
 
 
-    try
-    {
-        worker->thread =
-            std::thread(
-                &ThreadPool::worker_loop,
-                this,
-                worker
-            );
-    }
-    catch(...)
-    {
-        --worker_count_;
-
-        --workers_created_;
-
-        workers_.pop_back();
-
-        throw;
-    }
+    return worker;
 }
 
 
@@ -309,7 +389,9 @@ void ThreadPool::mark_exit_locked()
 // maybe_expand_locked
 // ============================================================
 
-void ThreadPool::maybe_expand_locked()
+ThreadPool::Worker* ThreadPool::maybe_expand_locked(
+    std::vector<std::unique_ptr<Worker>>& out
+)
 {
     /*
      * The caller must already hold mtx_.
@@ -319,6 +401,10 @@ void ThreadPool::maybe_expand_locked()
      * 1. There are queued tasks.
      * 2. The number of queued tasks exceeds the number of idle workers.
      * 3. The pool has not reached max_threads.
+     *
+     * Returns the newly created Worker (to be spawned outside the lock), or
+     * nullptr. Exited workers are reaped into out for the caller to join
+     * outside the lock.
      */
 
     /*
@@ -328,22 +414,22 @@ void ThreadPool::maybe_expand_locked()
      * filling up with dead entries when the pool never grows again.
      */
     if(exited_pending_ > 0)
-        reap_workers_locked();
+        reap_workers_locked(out);
 
 
     if(worker_count_ >= cfg_.max_threads)
-        return;
+        return nullptr;
 
 
     if(tasks_.empty())
-        return;
+        return nullptr;
 
 
     if(tasks_.size() <= idle_count_)
-        return;
+        return nullptr;
 
 
-    create_worker_locked();
+    return create_worker_locked();
 }
 
 
@@ -362,20 +448,20 @@ bool ThreadPool::pop_task_locked(Task& out)
 
 
     /*
-     * priority_queue exposes only a const reference to its top element.
+     * tasks_ is a max-heap on TaskCompare kept by push_heap / pop_heap.
      *
-     * The element itself is not const, so moving it out through
-     * const_cast is well defined here.
+     * pop_heap() moves the largest element (highest priority, then
+     * smallest sequence) to the back; we then move it out and shrink.
      */
-    out =
-        std::move(
-            const_cast<Task&>(
-                tasks_.top()
-            )
-        );
+    std::pop_heap(
+        tasks_.begin(),
+        tasks_.end(),
+        TaskCompare{}
+    );
 
+    out = std::move(tasks_.back());
 
-    tasks_.pop();
+    tasks_.pop_back();
 
 
     /*
@@ -675,8 +761,14 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
     }
 
 
-    tasks_.push(
+    tasks_.push_back(
         std::move(task)
+    );
+
+    std::push_heap(
+        tasks_.begin(),
+        tasks_.end(),
+        TaskCompare{}
     );
 
 
@@ -695,8 +787,14 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
 
     /*
      * Dynamically expand the worker pool according to the current load.
+     *
+     * maybe_expand_locked() returns a freshly created Worker (to be started
+     * outside the lock) and reaps exited ones into to_join.
      */
-    maybe_expand_locked();
+    std::vector<std::unique_ptr<Worker>> to_join;
+
+    Worker* new_worker =
+        maybe_expand_locked(to_join);
 
 
     /*
@@ -711,13 +809,45 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
 
 
     /*
-     * Release the lock before the syscall.
+     * Release the lock before any syscall or thread spawn.
      *
      * A thread that is woken while the mutex is still held would
      * immediately block again on it, which both wastes a context switch
      * and extends the critical section seen by every other submitter.
      */
     lock.unlock();
+
+
+    /*
+     * Join exited workers out here, never under mtx_: a join() can block
+     * for milliseconds and would otherwise stall the whole pool.
+     */
+    for(auto& w : to_join)
+    {
+        if(w->thread.joinable())
+            w->thread.join();
+    }
+
+
+    /*
+     * Start the newly created worker out here as well.
+     *
+     * On a spawn failure, roll the Worker back under the lock; the task we
+     * just queued is still drained by the remaining workers.
+     */
+    if(new_worker)
+    {
+        try
+        {
+            spawn_worker(new_worker);
+        }
+        catch(...)
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            rollback_worker_locked(new_worker);
+        }
+    }
 
 
     if(wake)
@@ -758,8 +888,14 @@ void ThreadPool::promote_scheduled_locked()
         &&
         it->first <= now)
     {
-        tasks_.push(
+        tasks_.push_back(
             std::move(it->second)
+        );
+
+        std::push_heap(
+            tasks_.begin(),
+            tasks_.end(),
+            TaskCompare{}
         );
 
         if(tasks_.size() > peak_queue_)
@@ -1641,23 +1777,69 @@ void ThreadPool::resize(
     }
 
 
-    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<Worker*> created;
+
+    std::vector<std::unique_ptr<Worker>> to_join;
 
 
-    cfg_.min_threads = min_threads;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
 
-    cfg_.max_threads = max_threads;
+
+        cfg_.min_threads = min_threads;
+
+        cfg_.max_threads = max_threads;
+
+
+        /*
+         * Reap exited workers now that they no longer fit the new floor.
+         */
+        if(exited_pending_ > 0)
+            reap_workers_locked(to_join);
+
+
+        /*
+         * Grow toward the new floor right away.
+         *
+         * create_worker_locked() already honors stopping_ and the (possibly
+         * raised) max_threads cap, so this cannot over-allocate. It only
+         * builds the Worker objects; the threads are spawned below.
+         */
+        while(worker_count_ < cfg_.min_threads)
+        {
+            Worker* w = create_worker_locked();
+
+            if(w)
+                created.push_back(w);
+        }
+    }
 
 
     /*
-     * Grow toward the new floor right away.
-     *
-     * create_worker_locked() already honors stopping_ and the (possibly
-     * raised) max_threads cap, so this cannot over-allocate.
+     * Join exited workers outside of the lock.
      */
-    while(worker_count_ < cfg_.min_threads)
+    for(auto& w : to_join)
     {
-        create_worker_locked();
+        if(w->thread.joinable())
+            w->thread.join();
+    }
+
+
+    /*
+     * Start the freshly created workers outside of the lock.
+     */
+    for(Worker* w : created)
+    {
+        try
+        {
+            spawn_worker(w);
+        }
+        catch(...)
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            rollback_worker_locked(w);
+        }
     }
 
 

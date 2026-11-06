@@ -1569,6 +1569,115 @@ static void test_wait_stress()
 }
 
 
+static void test_scaling_churn()
+{
+    using namespace std::chrono_literals;
+
+    ThreadPool::Config cfg = make_config();
+
+    cfg.min_threads = 2;
+    cfg.max_threads = 16;
+    cfg.max_queue = 8192;
+    cfg.idle_timeout = 120ms;
+
+    ThreadPool pool(cfg);
+
+    std::atomic<std::uint64_t> done{0};
+
+
+    /*
+     * Many rounds of "burst -> drain -> idle" drive the pool through a
+     * large number of worker create / reap cycles. Every create now spawns
+     * its thread outside of the pool lock and every reap joins outside of
+     * it, so this is a direct stress test of the 3.1.1 lock refactor.
+     */
+    const int rounds = 40;
+    const int burst = 300;
+
+    for(int r = 0; r < rounds; ++r)
+    {
+        std::vector<std::future<void>> futs;
+        futs.reserve(burst);
+
+        for(int i = 0; i < burst; ++i)
+        {
+            futs.push_back(
+                pool.submit(
+                    [&done]()
+                    {
+                        /*
+                         * A little real work so workers stay busy long
+                         * enough for the pool to expand under the burst.
+                         */
+                        volatile std::uint64_t acc = 0;
+
+                        for(int k = 0; k < 200; ++k)
+                            acc += k;
+
+                        done.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        );
+
+                        (void)acc;
+                    }
+                )
+            );
+        }
+
+        for(auto& f : futs)
+            f.get();
+
+        /* Let the pool idle out and reclaim the extra workers. */
+        sleep_ms(220);
+    }
+
+    const std::uint64_t expected =
+        static_cast<std::uint64_t>(rounds) * burst;
+
+    expect(
+        done.load() == expected,
+        "every churn-round task completed"
+    );
+
+
+    /*
+     * After idling, the pool must have settled back to the minimum and the
+     * reaper must not have leaked any slots.
+     */
+    sleep_ms(300);
+
+    const PoolMetrics m = pool.get_metrics();
+
+    expect(
+        m.worker_count <= cfg.max_threads,
+        "worker count never exceeds max_threads"
+    );
+
+    expect(
+        m.slots <= cfg.max_threads,
+        "live slots never exceed max_threads"
+    );
+
+
+    /*
+     * The pool is still usable after all that churn.
+     */
+    auto probe =
+        pool.submit(
+            []()
+            {
+                return 7;
+            }
+        );
+
+    expect(
+        probe.get() == 7,
+        "pool still executes tasks after heavy scaling churn"
+    );
+}
+
+
 int main()
 {
     test_basics();
@@ -1598,6 +1707,8 @@ int main()
     test_runtime_batch_and_accessors();
 
     test_wait_stress();
+
+    test_scaling_churn();
 
 
     std::printf(

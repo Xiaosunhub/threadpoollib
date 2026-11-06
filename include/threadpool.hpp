@@ -1,6 +1,7 @@
 #ifndef THREAD_POOL_HPP
 #define THREAD_POOL_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -31,10 +32,10 @@
  * and per-worker local queues arrive with 3.0.0.
  */
 #define THREADPOOL_VERSION_MAJOR 3
-#define THREADPOOL_VERSION_MINOR 0
-#define THREADPOOL_VERSION_PATCH 2
+#define THREADPOOL_VERSION_MINOR 1
+#define THREADPOOL_VERSION_PATCH 1
 
-#define THREADPOOL_VERSION_STRING "3.0.2"
+#define THREADPOOL_VERSION_STRING "3.1.1"
 
 
 enum class PoolStopMode
@@ -785,12 +786,21 @@ private:
     };
 
 
+    /*
+     * Ready (runnable) task heap.
+     *
+     * Implemented directly on a std::vector with make_heap / push_heap /
+     * pop_heap instead of std::priority_queue so that the backing storage
+     * can be reserve()'d up front to max_queue. That removes the
+     * reallocation (and the lock being held while every surviving element
+     * is copied) that a plain priority_queue would trigger as the queue
+     * grows, and caps the memory at max_queue.
+     *
+     * Ordering is identical to the old priority_queue: TaskCompare makes
+     * the highest priority (then smallest sequence) element sit at front().
+     */
     using TaskQueue =
-        std::priority_queue<
-            Task,
-            std::vector<Task>,
-            TaskCompare
-        >;
+        std::vector<Task>;
 
 
     /*
@@ -922,11 +932,46 @@ private:
 
     void worker_loop(Worker* self);
 
-    void create_worker_locked();
+    /*
+     * Creates the Worker object (and updates the counters) while holding
+     * mtx_, but does NOT start the OS thread. The caller spawns it outside
+     * the lock via spawn_worker() so that thread creation never blocks
+     * every other submitter.
+     *
+     * Returns the new Worker, or nullptr when stopped / at max_threads.
+     */
+    Worker* create_worker_locked();
 
-    void maybe_expand_locked();
+    /*
+     * Decides whether to grow, creating a Worker object under mtx_ when it
+     * does. Reaps exited workers into out (without joining). Returns the
+     * newly created Worker (to be spawned outside the lock), or nullptr.
+     */
+    Worker* maybe_expand_locked(
+        std::vector<std::unique_ptr<Worker>>& out
+    );
 
-    void reap_workers_locked();
+    /*
+     * Collects exited workers into out (erasing them from workers_) without
+     * joining their threads. The caller joins them outside of mtx_ so that a
+     * join() - which can block for milliseconds - never stalls the pool.
+     */
+    void reap_workers_locked(
+        std::vector<std::unique_ptr<Worker>>& out
+    );
+
+    /*
+     * Starts the OS thread for a Worker created by create_worker_locked().
+     *
+     * Called WITHOUT mtx_ held.
+     */
+    void spawn_worker(Worker* worker);
+
+    /*
+     * Undoes create_worker_locked() when spawn_worker() failed: removes the
+     * Worker from workers_ and restores the counters. Caller holds mtx_.
+     */
+    void rollback_worker_locked(Worker* worker);
 
 
     /*
