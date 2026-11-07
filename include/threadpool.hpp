@@ -45,12 +45,17 @@
  * (submit_token and friends), structured concurrency (TaskGroup),
  * non-blocking future continuations (then), submit_batch and the
  * failed / token_cancelled counters.
+ *
+ * 5.0.1 adds a task lifecycle hook (Task::on_abandon): discard paths
+ * (clear, stop(IMMEDIATE), handle.cancel) now release TaskGroup
+ * bookkeeping and fulfil its futures instead of hanging wait(). Group
+ * tasks also see their token through ThreadPool::current_token().
  */
 #define THREADPOOL_VERSION_MAJOR 5
 #define THREADPOOL_VERSION_MINOR 0
-#define THREADPOOL_VERSION_PATCH 0
+#define THREADPOOL_VERSION_PATCH 1
 
-#define THREADPOOL_VERSION_STRING "5.0.0"
+#define THREADPOOL_VERSION_STRING "5.0.1"
 
 
 enum class PoolStopMode
@@ -447,6 +452,9 @@ struct PoolMetrics
      */
     std::size_t scheduled = 0;
 };
+
+
+class TaskGroup;
 
 
 class ThreadPool
@@ -1394,6 +1402,14 @@ public:
 
 private:
 
+    /*
+     * TaskGroup uses the guarded submission engine directly: it needs to
+     * attach a lifecycle hook and an execution-context token that the
+     * public submit_token() API deliberately does not expose.
+     */
+    friend class TaskGroup;
+
+
     struct Task
     {
         int priority = 0;
@@ -1411,6 +1427,17 @@ private:
          * before invoking func, on every execution path.
          */
         CancellationToken token;
+
+        /*
+         * 5.0.1: lifecycle hook for a task that will never run.
+         *
+         * clear(), stop(IMMEDIATE) and TaskHandle::cancel() mark a queued
+         * task CANCELLED before its wrapper gets a chance to execute. A
+         * wrapper that owns external bookkeeping (TaskGroup does) still
+         * has to release it, otherwise wait() hangs forever. run_task()
+         * invokes this hook when it detects that the wrapper did not run.
+         */
+        std::function<void()> on_abandon;
 
         std::function<void()> func;
     };
@@ -1634,6 +1661,35 @@ private:
     auto do_submit_token(
         int priority,
         CancellationToken token,
+        bool allow_wait,
+        SubmitResult& status,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    /*
+     * The full engine behind do_submit_token().
+     *
+     * skip_on_cancel:
+     *   true  - a cancelled token makes the packaged_task throw
+     *           TaskCancelled before user code (submit_token semantics);
+     *   false - the token is only installed in the execution context, the
+     *           callable always runs and decides what cancellation means.
+     *
+     * on_abandon:
+     *   invoked by run_task() when the wrapper never ran (clear(),
+     *   stop(IMMEDIATE), TaskHandle::cancel(), submission rejected).
+     */
+    template <class F, class... Args>
+    auto do_submit_token_ex(
+        int priority,
+        CancellationToken token,
+        bool skip_on_cancel,
+        std::function<void()> on_abandon,
         bool allow_wait,
         SubmitResult& status,
         F&& f,
@@ -2237,9 +2293,11 @@ bool ThreadPool::wait_until(
 // ============================================================
 
 template <class F, class... Args>
-auto ThreadPool::do_submit_token(
+auto ThreadPool::do_submit_token_ex(
     int priority,
     CancellationToken token,
+    bool skip_on_cancel,
+    std::function<void()> on_abandon,
     bool allow_wait,
     SubmitResult& status,
     F&& f,
@@ -2287,12 +2345,17 @@ auto ThreadPool::do_submit_token(
      * before the user callable is entered lets packaged_task deliver
      * TaskCancelled through the future; the outer wrapper only has to
      * update the state and the counters.
+     *
+     * skip_on_cancel is false for TaskGroup: there the wrapper itself
+     * owns the cancellation check, so skipping it would strand the
+     * group's pending counter.
      */
     auto body =
         std::make_shared<Body>(
             [
                 this,
                 token,
+                skip_on_cancel,
                 callable =
                     Callable(
                         std::forward<F>(f)
@@ -2303,7 +2366,8 @@ auto ThreadPool::do_submit_token(
                     )
             ]() mutable -> ReturnType
             {
-                token.throw_if_cancelled();
+                if(skip_on_cancel)
+                    token.throw_if_cancelled();
 
 
                 try
@@ -2383,6 +2447,8 @@ auto ThreadPool::do_submit_token(
      * allocating.
      */
     task.token = token;
+
+    task.on_abandon = std::move(on_abandon);
 
     task.func =
         [this, body, token]()
@@ -2572,6 +2638,36 @@ auto ThreadPool::do_submit_token(
         std::move(future),
         std::move(handle)
     };
+}
+
+
+// ============================================================
+// do_submit_token (public API defaults: skip on cancel, no hook)
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::do_submit_token(
+    int priority,
+    CancellationToken token,
+    bool allow_wait,
+    SubmitResult& status,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return do_submit_token_ex(
+        priority,
+        std::move(token),
+        true,
+        std::function<void()>{},
+        allow_wait,
+        status,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
 }
 
 
@@ -3898,9 +3994,15 @@ private:
  * - records exceptions for rethrow_exceptions(),
  * - decrements the group's pending count under all outcomes.
  *
- * The last point is why the wrapper performs the token check itself
- * instead of using submit_token(): a skipped task would never run the
- * wrapper, and the group's pending count could never reach zero.
+ * The last point is why the group uses the guarded submission engine
+ * with skip_on_cancel = false: with submit_token() a cancelled task
+ * would be skipped entirely and the wrapper could never decrement
+ * pending. The same engine attaches an on_abandon hook, so tasks that
+ * are discarded by clear() / stop(IMMEDIATE) / handle.cancel() still
+ * release their bookkeeping and fulfil their futures with TaskCancelled.
+ *
+ * The group token is installed in the execution context too: inside a
+ * group task, ThreadPool::current_token() is the group's token.
  *
  * Note: wait()/wait_for()/wait_until() must be called from a thread that
  * is not a worker of this (or any) pool - blocking a worker while its
@@ -4023,10 +4125,62 @@ public:
         }
 
 
+        /*
+         * clear(), stop(IMMEDIATE), handle.cancel() and a rejected
+         * submission all prevent the wrapper from ever running. Without
+         * this hook the group's pending counter would never reach zero and
+         * wait() would hang forever.
+         *
+         * The hook also fulfils the caller's promise with TaskCancelled:
+         * a discarded group task must not leave a future that never
+         * completes.
+         */
+        auto abandon =
+            [group = state_, promise]()
+            {
+                std::exception_ptr ep =
+                    std::make_exception_ptr(
+                        TaskCancelled()
+                    );
+
+
+                try
+                {
+                    promise->set_exception(ep);
+                }
+                catch(...)
+                {
+                }
+
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        group->mtx
+                    );
+
+                    ++group->failed;
+
+                    group->errors.push_back(ep);
+                }
+
+
+                finish_one(group);
+            };
+
+
+        ThreadPool::SubmitResult status =
+            ThreadPool::SubmitResult::ACCEPTED;
+
+
         try
         {
-            pool_.submit_priority(
+            (void)pool_.do_submit_token_ex(
                 priority,
+                token,
+                false,
+                abandon,
+                true,
+                status,
                 [
                     group = state_,
                     promise,
@@ -4103,13 +4257,26 @@ public:
         catch(...)
         {
             /*
-             * submit_priority() can throw (stopped pool, full queue). The
-             * task will never run, so undo the pending increment here or
-             * wait() would hang forever.
+             * An exception before enqueueing (allocation failure, stopped
+             * pool) means no wrapper and no run_task(): release here.
              */
-            finish_one(state_);
+            abandon();
 
             throw;
+        }
+
+
+        if(status
+            != ThreadPool::SubmitResult::ACCEPTED
+            &&
+            status
+            != ThreadPool::SubmitResult::CALLER_RUNS)
+        {
+            abandon();
+
+            throw std::runtime_error(
+                "TaskGroup: task rejected by the pool"
+            );
         }
 
 

@@ -2616,6 +2616,330 @@ void test_v5_continuations_batches_and_groups()
 }
 
 
+/* ------------------------------------------------------------------
+ * 5.0.1 regressions: a discarded task must never strand a TaskGroup.
+ * ------------------------------------------------------------------ */
+
+void test_v501_discard_and_context()
+{
+    ThreadPool::Config cfg;
+    cfg.min_threads = 1;
+    cfg.max_threads = 1;
+
+
+    /* clear() drops queued group tasks before their wrappers can run. */
+    {
+        ThreadPool pool(cfg);
+
+        auto group =
+            std::make_unique<TaskGroup>(pool);
+
+        std::promise<void> started;
+        auto started_future = started.get_future();
+
+        auto blocker = group->submit(
+            [&started]()
+            {
+                started.set_value();
+
+                sleep_ms(120);
+
+                return 1;
+            }
+        );
+
+        started_future.wait();
+
+
+        std::vector<std::future<int>> queued;
+
+        for(int i = 0; i < 5; ++i)
+        {
+            queued.push_back(
+                group->submit(
+                    [i]()
+                    {
+                        return i;
+                    }
+                )
+            );
+        }
+
+
+        const std::size_t dropped = pool.clear();
+
+        expect(
+            dropped >= 5,
+            "clear() discards the queued group tasks"
+        );
+
+
+        const bool drained =
+            group->wait_for(
+                std::chrono::milliseconds(1000)
+            );
+
+        expect(
+            drained
+                &&
+            group->pending() == 0,
+            "clear() does not strand TaskGroup::wait()"
+        );
+
+
+        if(drained)
+        {
+            int cancelled_count = 0;
+
+            for(auto& f : queued)
+            {
+                try
+                {
+                    (void)f.get();
+                }
+                catch(const TaskCancelled&)
+                {
+                    ++cancelled_count;
+                }
+                catch(...)
+                {
+                }
+            }
+
+            expect(
+                cancelled_count >= 1,
+                "discarded group futures carry TaskCancelled"
+            );
+
+            expect(
+                blocker.get() == 1,
+                "clear() leaves the running task alone"
+            );
+        }
+        else
+        {
+            expect(
+                false,
+                "discarded group futures carry TaskCancelled"
+            );
+
+            expect(
+                false,
+                "clear() leaves the running task alone"
+            );
+
+            /* Deliberate leak: never hang the test binary on a regression. */
+            group.release();
+        }
+    }
+
+
+    /* stop(IMMEDIATE) takes the same discard path. */
+    {
+        ThreadPool pool(cfg);
+
+        auto group =
+            std::make_unique<TaskGroup>(pool);
+
+        std::promise<void> started;
+        auto started_future = started.get_future();
+
+        auto blocker = group->submit(
+            [&started]()
+            {
+                started.set_value();
+
+                sleep_ms(120);
+
+                return 1;
+            }
+        );
+
+        started_future.wait();
+
+
+        std::vector<std::future<int>> queued;
+
+        for(int i = 0; i < 5; ++i)
+        {
+            queued.push_back(
+                group->submit(
+                    [i]()
+                    {
+                        return i;
+                    }
+                )
+            );
+        }
+
+
+        pool.stop(PoolStopMode::IMMEDIATE);
+
+        const bool drained =
+            group->wait_for(
+                std::chrono::milliseconds(1000)
+            );
+
+        expect(
+            drained
+                &&
+            group->pending() == 0,
+            "stop(IMMEDIATE) does not strand TaskGroup::wait()"
+        );
+
+
+        if(drained)
+        {
+            int cancelled_count = 0;
+
+            for(auto& f : queued)
+            {
+                try
+                {
+                    (void)f.get();
+                }
+                catch(const TaskCancelled&)
+                {
+                    ++cancelled_count;
+                }
+                catch(...)
+                {
+                }
+            }
+
+            expect(
+                cancelled_count >= 1,
+                "stop(IMMEDIATE) fulfils discarded futures"
+            );
+
+            expect(
+                blocker.get() == 1,
+                "stop(IMMEDIATE) leaves the running task alone"
+            );
+        }
+        else
+        {
+            expect(
+                false,
+                "stop(IMMEDIATE) fulfils discarded futures"
+            );
+
+            expect(
+                false,
+                "stop(IMMEDIATE) leaves the running task alone"
+            );
+
+            group.release();
+        }
+    }
+
+
+    /* A group task now sees the group token in the execution context. */
+    {
+        ThreadPool pool(cfg);
+
+        TaskGroup group(pool);
+
+        auto token = group.token();
+
+        auto value = group.submit(
+            [&token]()
+            {
+                return ThreadPool::current_token()
+                        .cancellable()
+                    &&
+                ThreadPool::current_token()
+                        .is_cancelled()
+                    == token.is_cancelled();
+            }
+        );
+
+        expect(
+            value.get(),
+            "group task exposes its token via current_token()"
+        );
+
+        group.wait();
+    }
+
+
+    /* Cooperative cancellation through current_token() inside a group. */
+    {
+        ThreadPool pool(cfg);
+
+        auto group =
+            std::make_unique<TaskGroup>(
+                pool,
+                GroupDestroyPolicy::CANCEL_AND_WAIT
+            );
+
+        std::promise<void> started;
+        auto started_future = started.get_future();
+
+        std::atomic<bool> observed{false};
+
+        auto task = group->submit(
+            [&started, &observed]()
+            {
+                started.set_value();
+
+                for(int i = 0; i < 400; ++i)
+                {
+                    if(ThreadPool::current_token()
+                        .is_cancelled())
+                    {
+                        observed.store(true);
+
+                        ThreadPool::current_token()
+                            .throw_if_cancelled();
+                    }
+
+                    sleep_ms(1);
+                }
+            }
+        );
+
+        started_future.wait();
+
+        group->request_cancel();
+
+        bool threw = false;
+
+        try
+        {
+            task.get();
+        }
+        catch(const TaskCancelled&)
+        {
+            threw = true;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            threw && observed.load(),
+            "group task cancels via current_token()"
+        );
+
+        const bool drained =
+            group->wait_for(
+                std::chrono::milliseconds(1000)
+            );
+
+        expect(
+            drained,
+            "cooperative group cancel drains pending"
+        );
+
+        if(!drained)
+            group.release();
+    }
+
+
+}
+
+
 int main()
 {
     test_basics();
@@ -2653,6 +2977,8 @@ int main()
     test_v5_context_and_cancellation();
 
     test_v5_continuations_batches_and_groups();
+
+    test_v501_discard_and_context();
 
 
     std::printf(

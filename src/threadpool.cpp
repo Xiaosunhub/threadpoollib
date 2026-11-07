@@ -1546,6 +1546,28 @@ void ThreadPool::run_task(Task& task)
      * tasks - so current_token() is always the token of the task actually
      * executing, never a stale one from an outer task.
      */
+    /*
+     * clear(), stop(IMMEDIATE) and TaskHandle::cancel() all mark a queued
+     * task CANCELLED before its wrapper is entered. The wrapper's
+     * WAITING -> RUNNING transition then fails and it returns without
+     * invoking user code.
+     *
+     * Detect that case up front: a wrapper that owns external bookkeeping
+     * (TaskGroup's pending counter and promise) must still release it, or
+     * wait() would hang forever.
+     *
+     * A token cancellation is NOT an abandon: there the wrapper does run
+     * and only the packaged_task callable is skipped, so the state starts
+     * out WAITING here.
+     */
+    const bool abandoned_before_run =
+        task.state
+        &&
+        task.state->load(
+            std::memory_order_acquire
+        ) == TaskState::CANCELLED;
+
+
     CancellationToken previous =
         t_current_token;
 
@@ -1566,6 +1588,23 @@ void ThreadPool::run_task(Task& task)
 
 
     t_current_token = previous;
+
+
+    if(abandoned_before_run
+        &&
+        task.on_abandon)
+    {
+        try
+        {
+            task.on_abandon();
+        }
+        catch(...)
+        {
+            /*
+             * A cleanup hook must not take the worker down either.
+             */
+        }
+    }
 
 
     /*
