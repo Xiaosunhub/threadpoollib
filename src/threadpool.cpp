@@ -25,10 +25,28 @@ namespace
 
 
     /*
+     * 5.0.0 execution context.
+     *
+     * run_task() swaps t_current_token for the duration of one task, so a
+     * callable can reach its own cancellation domain (and its worker id)
+     * without any argument threading. The worker id is assigned once per
+     * worker thread by WorkerScope, not per task.
+     */
+    thread_local CancellationToken t_current_token;
+
+    thread_local std::size_t t_worker_id =
+        ThreadPool::no_worker;
+
+    std::atomic<std::size_t> g_next_worker_id{1};
+
+
+    /*
      * Marks the thread as a worker for the lifetime of the object.
      *
      * RAII rather than a manual reset so that the flag is also cleared on
-     * an early return.
+     * an early return. The previous context is saved because a worker may
+     * synchronously run a task of another pool (CALLER_RUNS), and that
+     * nested context must be restored afterwards.
      */
     struct WorkerScope
     {
@@ -38,15 +56,34 @@ namespace
         )
             : previous_(t_worker_of)
             , prev_self_(t_worker_self)
+            , prev_token_(t_current_token)
+            , prev_id_(t_worker_id)
         {
             t_worker_of = pool;
             t_worker_self = self;
+
+            t_current_token = CancellationToken{};
+
+            if(pool)
+            {
+                t_worker_id =
+                    g_next_worker_id.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+            }
+            else
+            {
+                t_worker_id = ThreadPool::no_worker;
+            }
         }
 
         ~WorkerScope()
         {
             t_worker_of = previous_;
             t_worker_self = prev_self_;
+            t_current_token = prev_token_;
+            t_worker_id = prev_id_;
         }
 
         WorkerScope(const WorkerScope&) = delete;
@@ -56,7 +93,31 @@ namespace
     private:
         const ThreadPool* previous_;
         void* prev_self_;
+        CancellationToken prev_token_;
+        std::size_t prev_id_;
     };
+}
+
+
+// ============================================================
+// task execution context (5.0.0)
+// ============================================================
+
+std::size_t ThreadPool::current_worker_id()
+{
+    return t_worker_id;
+}
+
+
+const ThreadPool* ThreadPool::current_pool()
+{
+    return t_worker_of;
+}
+
+
+CancellationToken ThreadPool::current_token()
+{
+    return t_current_token;
 }
 
 
@@ -850,7 +911,13 @@ ThreadPool::SubmitResult ThreadPool::enqueue_task(
         }
         catch(...)
         {
-            std::lock_guard<std::mutex> lock(mtx_);
+            /*
+             * Named differently from the outer unique_lock: C4456 at /W4
+             * otherwise complains about a shadowed local declaration.
+             */
+            std::lock_guard<std::mutex> rollback_lock(
+                mtx_
+            );
 
             rollback_worker_locked(new_worker);
         }
@@ -1471,6 +1538,20 @@ void ThreadPool::run_task(Task& task)
      * do_submit(), so this only has to make sure that neither an escaping
      * exception nor a captured destructor can kill the caller.
      */
+    /*
+     * Install the task's cancellation domain in the thread-local context.
+     *
+     * Every execution path goes through run_task() - global queue, local
+     * deque, stolen task, promoted scheduled task, caller-runs and dropped
+     * tasks - so current_token() is always the token of the task actually
+     * executing, never a stale one from an outer task.
+     */
+    CancellationToken previous =
+        t_current_token;
+
+    t_current_token = task.token;
+
+
     try
     {
         task.func();
@@ -1482,6 +1563,9 @@ void ThreadPool::run_task(Task& task)
          * submitting thread.
          */
     }
+
+
+    t_current_token = previous;
 
 
     /*
@@ -1815,6 +1899,16 @@ PoolMetrics ThreadPool::get_metrics() const
 
     metrics.stolen =
         stolen_.load(
+            std::memory_order_relaxed
+        );
+
+    metrics.failed =
+        failed_.load(
+            std::memory_order_relaxed
+        );
+
+    metrics.token_cancelled =
+        token_cancelled_.load(
             std::memory_order_relaxed
         );
 

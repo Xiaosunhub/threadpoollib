@@ -1917,6 +1917,705 @@ static void test_work_stealing_and_composition()
 }
 
 
+/* ------------------------------------------------------------------
+ * 5.0.0: task context, cooperative cancellation, continuations,
+ * batch submission and structured concurrency.
+ * ------------------------------------------------------------------ */
+
+void test_v5_context_and_cancellation()
+{
+    ThreadPool pool;
+
+
+    /* Outside a task there is no context at all. */
+    expect(
+        ThreadPool::current_worker_id()
+            == ThreadPool::no_worker,
+        "context: no worker id outside a task"
+    );
+
+    expect(
+        ThreadPool::current_pool() == nullptr,
+        "context: no owning pool outside a task"
+    );
+
+    expect(
+        !ThreadPool::current_token().cancellable(),
+        "context: no token outside a task"
+    );
+
+
+    /* A classic task still runs, but has no attached token. */
+    auto plain = pool.submit(
+        [&pool]()
+        {
+            return ThreadPool::current_worker_id()
+                    != ThreadPool::no_worker
+                &&
+                ThreadPool::current_pool()
+                    == &pool
+                &&
+                !ThreadPool::current_token()
+                    .cancellable();
+        }
+    );
+
+    expect(
+        plain.get(),
+        "context: worker id / pool / empty token in task"
+    );
+
+
+    /* A token task sees exactly its own cancellation domain. */
+    CancellationSource src;
+
+    auto attached = pool.submit_token(
+        src.token(),
+        [&src]()
+        {
+            return ThreadPool::current_token()
+                    .cancellable()
+                &&
+                !ThreadPool::current_token()
+                    .is_cancelled()
+                &&
+                src.token().is_cancelled()
+                    == ThreadPool::current_token()
+                        .is_cancelled();
+        }
+    );
+
+    expect(
+        attached.get(),
+        "context: submit_token installs its token"
+    );
+
+
+    /* Cancelling before submission skips the callable. */
+    CancellationSource dead;
+
+    expect(
+        dead.request_cancel()
+            &&
+        !dead.request_cancel(),
+        "CancellationSource::request_cancel is idempotent"
+    );
+
+    auto skipped = pool.submit_token(
+        dead.token(),
+        []()
+        {
+            return 11;
+        }
+    );
+
+    bool got_task_cancelled = false;
+
+    try
+    {
+        (void)skipped.get();
+    }
+    catch(const TaskCancelled&)
+    {
+        got_task_cancelled = true;
+    }
+    catch(...)
+    {
+    }
+
+    expect(
+        got_task_cancelled,
+        "token: cancelled task future carries TaskCancelled"
+    );
+
+    expect(
+        pool.get_metrics().token_cancelled >= 1,
+        "metrics: token_cancelled is counted"
+    );
+
+
+    /* A running task observes cancellation through current_token(). */
+    CancellationSource live;
+
+    std::promise<void> started;
+    auto started_future = started.get_future();
+
+    std::atomic<bool> observed{false};
+
+    auto cooperating = pool.submit_token(
+        live.token(),
+        [&started, &observed]()
+        {
+            started.set_value();
+
+            for(int i = 0; i < 400; ++i)
+            {
+                if(ThreadPool::current_token()
+                    .is_cancelled())
+                {
+                    observed.store(true);
+
+                    ThreadPool::current_token()
+                        .throw_if_cancelled();
+                }
+
+                sleep_ms(1);
+            }
+        }
+    );
+
+    started_future.wait();
+
+    live.request_cancel();
+
+    bool cooperative_cancel = false;
+
+    try
+    {
+        cooperating.get();
+    }
+    catch(const TaskCancelled&)
+    {
+        cooperative_cancel = true;
+    }
+    catch(...)
+    {
+    }
+
+    expect(
+        cooperative_cancel && observed.load(),
+        "token: running task cooperatively cancels"
+    );
+
+
+    /* The other token-aware entry points stay usable. */
+    auto handle_result = pool.submit_cancellable_token(
+        3,
+        CancellationToken{},
+        []()
+        {
+            return 4;
+        }
+    );
+
+    expect(
+        handle_result.handle.valid()
+            &&
+        handle_result.future.get() == 4,
+        "submit_cancellable_token returns handle + value"
+    );
+
+    auto optional_result = pool.try_submit_token(
+        CancellationToken{},
+        []()
+        {
+            return 5;
+        }
+    );
+
+    expect(
+        optional_result.has_value()
+            &&
+        optional_result->get() == 5,
+        "try_submit_token accepts a task"
+    );
+
+    auto deferred = pool.submit_after_token(
+        std::chrono::milliseconds(5),
+        dead.token(),
+        []()
+        {
+            return 6;
+        }
+    );
+
+    bool deferred_cancelled = false;
+
+    try
+    {
+        (void)deferred.get();
+    }
+    catch(const TaskCancelled&)
+    {
+        deferred_cancelled = true;
+    }
+    catch(...)
+    {
+    }
+
+    expect(
+        deferred_cancelled,
+        "submit_after_token honours a cancelled token"
+    );
+
+
+    /* User exceptions are still delivered, and now counted. */
+    const std::uint64_t failed_before =
+        pool.get_metrics().failed;
+
+    auto throwing = pool.submit(
+        []() -> int
+        {
+            throw std::runtime_error("boom");
+        }
+    );
+
+    bool user_exception = false;
+
+    try
+    {
+        (void)throwing.get();
+    }
+    catch(const std::runtime_error&)
+    {
+        user_exception = true;
+    }
+
+    expect(
+        user_exception
+            &&
+        pool.get_metrics().failed
+            > failed_before,
+        "metrics: failed counts user exceptions"
+    );
+
+
+    pool.wait();
+}
+
+
+void test_v5_continuations_batches_and_groups()
+{
+    ThreadPool pool;
+
+
+    /* then() on a value future. */
+    auto chained = pool.then(
+        pool.submit(
+            []()
+            {
+                return 3;
+            }
+        ),
+        [](int x)
+        {
+            return x * 2;
+        }
+    );
+
+    expect(
+        chained.get() == 6,
+        "then(value) chains without blocking"
+    );
+
+
+    /* then() on a void future, with a value and with a void result. */
+    auto from_void = pool.then(
+        pool.submit(
+            []()
+            {
+            }
+        ),
+        []()
+        {
+            return 9;
+        }
+    );
+
+    std::atomic<int> side_effect{0};
+
+    auto to_void = pool.then(
+        pool.submit(
+            []()
+            {
+            }
+        ),
+        [&side_effect]()
+        {
+            ++side_effect;
+        }
+    );
+
+    to_void.get();
+
+    expect(
+        from_void.get() == 9
+            &&
+        side_effect.load() == 1,
+        "then(void) supports value and void results"
+    );
+
+
+    /* An exception in the predecessor skips the continuation. */
+    auto bad = pool.submit(
+        []() -> int
+        {
+            throw std::runtime_error("boom");
+        }
+    );
+
+    auto propagated = pool.then(
+        std::move(bad),
+        [](int x)
+        {
+            return x + 1;
+        }
+    );
+
+    bool exception_propagated = false;
+
+    try
+    {
+        (void)propagated.get();
+    }
+    catch(const std::runtime_error&)
+    {
+        exception_propagated = true;
+    }
+
+    expect(
+        exception_propagated,
+        "then() propagates predecessor exceptions"
+    );
+
+
+    /* Batch submission keeps index order. */
+    auto batch = pool.submit_batch(
+        8,
+        [](std::size_t i)
+        {
+            return i * i;
+        }
+    );
+
+    bool batch_ok = (batch.size() == 8);
+
+    for(std::size_t i = 0; i < batch.size(); ++i)
+    {
+        if(batch[i].get() != i * i)
+            batch_ok = false;
+    }
+
+    expect(
+        batch_ok,
+        "submit_batch preserves index order"
+    );
+
+    auto priority_batch = pool.submit_batch_priority(
+        7,
+        3,
+        [](std::size_t i)
+        {
+            return static_cast<int>(i) + 1;
+        }
+    );
+
+    expect(
+        priority_batch.size() == 3
+            &&
+        priority_batch[0].get() == 1
+            &&
+        priority_batch[2].get() == 3,
+        "submit_batch_priority works"
+    );
+
+
+    /* A group waits only for its own tasks. */
+    std::promise<void> outside_started;
+    auto outside_started_future =
+        outside_started.get_future();
+
+    auto outside = pool.submit(
+        [&outside_started]()
+        {
+            outside_started.set_value();
+
+            sleep_ms(200);
+        }
+    );
+
+    outside_started_future.wait();
+
+
+    TaskGroup group(pool);
+
+    auto group_value = group.submit(
+        []()
+        {
+            return 42;
+        }
+    );
+
+    expect(
+        group.wait_for(std::chrono::milliseconds(500))
+            &&
+        group_value.get() == 42,
+        "TaskGroup::wait_for waits only for the group"
+    );
+
+    expect(
+        group.pending() == 0
+            &&
+        group.submitted() == 1
+            &&
+        group.failed() == 0,
+        "TaskGroup counters are accurate"
+    );
+
+    outside.get();
+
+
+    /* Group cancellation is cooperative and never leaks pending work. */
+    ThreadPool::Config single_cfg;
+    single_cfg.min_threads = 1;
+    single_cfg.max_threads = 1;
+
+    ThreadPool single(single_cfg);
+
+    {
+        TaskGroup cancelling(single);
+
+        std::promise<void> blocker_started;
+        auto blocker_future =
+            blocker_started.get_future();
+
+        auto blocker = cancelling.submit(
+            [&blocker_started]()
+            {
+                blocker_started.set_value();
+
+                sleep_ms(120);
+
+                return 1;
+            }
+        );
+
+        blocker_future.wait();
+
+
+        std::vector<std::future<int>> queued;
+
+        for(int i = 0; i < 6; ++i)
+        {
+            queued.push_back(
+                cancelling.submit(
+                    [i]()
+                    {
+                        return i;
+                    }
+                )
+            );
+        }
+
+
+        expect(
+            cancelling.request_cancel()
+                &&
+            cancelling.is_cancelled(),
+            "TaskGroup::request_cancel flips the token"
+        );
+
+
+        cancelling.wait();
+
+        int cancelled_count = 0;
+
+        for(auto& f : queued)
+        {
+            try
+            {
+                (void)f.get();
+            }
+            catch(const TaskCancelled&)
+            {
+                ++cancelled_count;
+            }
+            catch(...)
+            {
+            }
+        }
+
+        expect(
+            cancelled_count >= 1,
+            "TaskGroup: queued tasks observe cancellation"
+        );
+
+        expect(
+            cancelling.pending() == 0
+                &&
+            blocker.get() == 1,
+            "TaskGroup: pending reaches zero after cancel"
+        );
+
+
+        bool submit_after_cancel = false;
+
+        try
+        {
+            (void)cancelling.submit(
+                []()
+                {
+                    return 0;
+                }
+            );
+        }
+        catch(const TaskCancelled&)
+        {
+            submit_after_cancel = true;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            submit_after_cancel,
+            "TaskGroup rejects submissions after cancel"
+        );
+    }
+
+
+    /* Exception aggregation. */
+    {
+        TaskGroup failing(pool);
+
+        std::vector<std::future<int>> futures;
+
+        for(int i = 0; i < 3; ++i)
+        {
+            futures.push_back(
+                failing.submit(
+                    []() -> int
+                    {
+                        throw std::runtime_error("bad");
+                    }
+                )
+            );
+        }
+
+        failing.wait();
+
+        bool aggregated = false;
+
+        try
+        {
+            failing.rethrow_exceptions();
+        }
+        catch(const TaskGroupError& e)
+        {
+            aggregated =
+                e.size() == 3
+                &&
+                e.errors().size() == 3;
+        }
+
+        expect(
+            failing.failed() == 3
+                &&
+            aggregated,
+            "TaskGroup aggregates task exceptions"
+        );
+    }
+
+
+    /* RAII: the destructor waits, CANCEL_AND_WAIT cancels first. */
+    std::atomic<int> finished{0};
+
+    {
+        TaskGroup raii(pool);
+
+        for(int i = 0; i < 4; ++i)
+        {
+            (void)raii.submit(
+                [&finished]()
+                {
+                    sleep_ms(10);
+
+                    ++finished;
+                }
+            );
+        }
+    }
+
+    expect(
+        finished.load() == 4,
+        "TaskGroup destructor waits for all tasks"
+    );
+
+
+    CancellationToken observed_token;
+
+    std::atomic<int> cooperative_done{0};
+
+    {
+        TaskGroup auto_cancel(
+            pool,
+            GroupDestroyPolicy::CANCEL_AND_WAIT
+        );
+
+        observed_token = auto_cancel.token();
+
+        std::promise<void> started;
+        auto started_future = started.get_future();
+
+        (void)auto_cancel.submit(
+            [&started, &cooperative_done, &observed_token]()
+            {
+                started.set_value();
+
+                while(!observed_token.is_cancelled())
+                    sleep_ms(1);
+
+                ++cooperative_done;
+            }
+        );
+
+        started_future.wait();
+    }
+
+    expect(
+        observed_token.is_cancelled()
+            &&
+        cooperative_done.load() == 1,
+        "CANCEL_AND_WAIT cancels then joins"
+    );
+
+
+    /* wait() from a worker must be diagnosed, not deadlocked. */
+    auto from_worker = pool.submit(
+        [&pool]()
+        {
+            TaskGroup nested(pool);
+
+            (void)nested.submit(
+                []()
+                {
+                    return 1;
+                }
+            );
+
+            try
+            {
+                nested.wait();
+
+                return false;
+            }
+            catch(const std::logic_error&)
+            {
+                return true;
+            }
+        }
+    );
+
+    expect(
+        from_worker.get(),
+        "TaskGroup::wait rejects worker-thread calls"
+    );
+
+
+    pool.wait();
+}
+
+
 int main()
 {
     test_basics();
@@ -1950,6 +2649,10 @@ int main()
     test_scaling_churn();
 
     test_work_stealing_and_composition();
+
+    test_v5_context_and_cancellation();
+
+    test_v5_continuations_batches_and_groups();
 
 
     std::printf(

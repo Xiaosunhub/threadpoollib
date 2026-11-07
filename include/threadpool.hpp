@@ -37,12 +37,20 @@
  * It also adds future composition (when_all / when_any) and a process-wide
  * default_pool() for fire-and-forget use. The stolen counter in
  * PoolMetrics is new in 4.0.0.
+ *
+ * 5.0.0 turns the task into an execution context: every Task carries a
+ * cooperative cancellation token, and every execution path installs that
+ * context (token, worker id, owning pool) in thread-local storage before
+ * invoking the callable. On top of that it adds cooperative cancellation
+ * (submit_token and friends), structured concurrency (TaskGroup),
+ * non-blocking future continuations (then), submit_batch and the
+ * failed / token_cancelled counters.
  */
-#define THREADPOOL_VERSION_MAJOR 4
+#define THREADPOOL_VERSION_MAJOR 5
 #define THREADPOOL_VERSION_MINOR 0
 #define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "4.0.0"
+#define THREADPOOL_VERSION_STRING "5.0.0"
 
 
 enum class PoolStopMode
@@ -100,7 +108,199 @@ namespace threadpool_detail
 
         std::packaged_task<T()> task;
     };
+
+
+    /*
+     * Shared flag behind CancellationToken / CancellationSource.
+     *
+     * A separate heap block is deliberate: a token is copied into every
+     * task that belongs to a cancellation domain, and cancelling the
+     * source must be visible to all of them at once without any registry
+     * or callback list to maintain.
+     */
+    struct CancellationState
+    {
+        std::atomic<bool> flag{false};
+    };
+
+
+    /*
+     * Result type of then(): a void predecessor passes no argument to the
+     * continuation, a value predecessor passes its result.
+     *
+     * The specialization keeps std::invoke_result_t<F, void> from ever
+     * being formed - that instantiation is ill-formed for a void-only
+     * callable and would break the whole overload.
+     */
+    template <class T, class F, bool = std::is_void_v<T>>
+    struct ThenResult;
+
+    template <class T, class F>
+    struct ThenResult<T, F, false>
+    {
+        using type =
+            std::invoke_result_t<F, T>;
+    };
+
+    template <class T, class F>
+    struct ThenResult<T, F, true>
+    {
+        using type =
+            std::invoke_result_t<F>;
+    };
 }
+
+
+/**
+ * Thrown when a task observes a cancellation request.
+ *
+ * A task submitted through submit_token() receives this exception in its
+ * future if the token was cancelled before the task started. Long-running
+ * tasks can also receive it by calling token.throw_if_cancelled() (or
+ * ThreadPool::current_token().throw_if_cancelled()) themselves.
+ */
+class TaskCancelled : public std::runtime_error
+{
+public:
+    TaskCancelled()
+        : std::runtime_error(
+            "ThreadPool: task cancelled"
+        )
+    {
+    }
+
+    explicit TaskCancelled(
+        const char* what
+    )
+        : std::runtime_error(what)
+    {
+    }
+};
+
+
+/**
+ * A cheap, copyable view of a cancellation flag.
+ *
+ * A default-constructed token is never cancellable: cancellable() is
+ * false and every check is a single pointer test. Tokens are obtained
+ * from CancellationSource::token() or TaskGroup::token().
+ *
+ * This is cooperative cancellation, not thread termination: a task that
+ * never checks its token will run to completion even after a request.
+ */
+class CancellationToken
+{
+public:
+    CancellationToken() = default;
+
+
+    bool is_cancelled() const
+    {
+        return state_
+            &&
+            state_->flag.load(
+                std::memory_order_acquire
+            );
+    }
+
+
+    void throw_if_cancelled() const
+    {
+        if(is_cancelled())
+            throw TaskCancelled();
+    }
+
+
+    bool cancellable() const
+    {
+        return static_cast<bool>(state_);
+    }
+
+
+    explicit operator bool() const
+    {
+        return cancellable();
+    }
+
+
+private:
+    explicit CancellationToken(
+        std::shared_ptr<
+            threadpool_detail::CancellationState
+        > state
+    )
+        : state_(std::move(state))
+    {
+    }
+
+
+private:
+    std::shared_ptr<
+        threadpool_detail::CancellationState
+    > state_;
+
+
+    friend class CancellationSource;
+};
+
+
+/**
+ * The writable side of a cancellation domain.
+ *
+ * request_cancel() is idempotent and thread-safe; it returns true only
+ * for the caller that actually flipped the flag from false to true.
+ */
+class CancellationSource
+{
+public:
+    CancellationSource()
+        : state_(
+            std::make_shared<
+                threadpool_detail::CancellationState
+            >()
+        )
+    {
+    }
+
+
+    CancellationToken token() const
+    {
+        return CancellationToken(state_);
+    }
+
+
+    bool request_cancel()
+    {
+        bool expected = false;
+
+        return state_->flag.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel
+        );
+    }
+
+
+    bool is_cancelled() const
+    {
+        return state_->flag.load(
+            std::memory_order_acquire
+        );
+    }
+
+
+    void throw_if_cancelled() const
+    {
+        if(is_cancelled())
+            throw TaskCancelled();
+    }
+
+
+private:
+    std::shared_ptr<
+        threadpool_detail::CancellationState
+    > state_;
+};
 
 
 /**
@@ -226,6 +426,19 @@ struct PoolMetrics
      * load-balancing fork-join work rather than leaving it on the producer.
      */
     std::uint64_t stolen = 0;
+
+    /*
+     * 5.0.0 diagnostics.
+     *
+     * failed counts user callables that threw; the exception is still
+     * delivered through the task's future as before. A task cancelled
+     * through a CancellationToken is not a failure - it is counted by
+     * token_cancelled instead - because cancellation is a requested
+     * outcome, not an error.
+     */
+    std::uint64_t failed = 0;
+
+    std::uint64_t token_cancelled = 0;
 
 
     /*
@@ -735,6 +948,189 @@ public:
 
 
     // ============================================================
+    // Task execution context (5.0.0)
+    // ============================================================
+
+    /*
+     * Sentinel returned by current_worker_id() on a thread that is not a
+     * worker of any ThreadPool.
+     */
+    static constexpr std::size_t no_worker =
+        static_cast<std::size_t>(-1);
+
+
+    /**
+     * Stable id of the worker thread running the current task, or
+     * no_worker outside of a task.
+     *
+     * Ids are process-wide and monotonically assigned, so two pools never
+     * report the same id. Useful for thread-local sharding / diagnostics.
+     */
+    static std::size_t current_worker_id();
+
+
+    /** The pool owning the current worker thread, or nullptr. */
+    static const ThreadPool* current_pool();
+
+
+    /**
+     * Cancellation token attached to the task currently executing.
+     *
+     * Every execution path (global queue, local deque, stolen task,
+     * promoted scheduled task, caller-runs) installs this in thread-local
+     * storage before invoking the callable, so a task can cooperatively
+     * check cancellation without receiving a token as an argument.
+     *
+     * Returns a non-cancellable (empty) token for a task submitted without
+     * one, and for code outside a task.
+     */
+    static CancellationToken current_token();
+
+
+    // ============================================================
+    // Cooperative cancellation (5.0.0)
+    // ============================================================
+
+    /**
+     * Submit a task attached to a cancellation domain.
+     *
+     * If the token is cancelled before the task starts, the callable is
+     * skipped and its future completes with TaskCancelled instead of
+     * hanging on a broken promise. A task already running can observe the
+     * same token via ThreadPool::current_token().
+     */
+    template <class F, class... Args>
+    auto submit_token(
+        CancellationToken token,
+        F&& f,
+        Args&&... args
+    )
+        -> std::future<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class F, class... Args>
+    auto submit_token_priority(
+        int priority,
+        CancellationToken token,
+        F&& f,
+        Args&&... args
+    )
+        -> std::future<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    /**
+     * Same as submit_token_priority(), but also returns a TaskHandle so
+     * the task can be cancelled individually through the 2.x API.
+     */
+    template <class F, class... Args>
+    auto submit_cancellable_token(
+        int priority,
+        CancellationToken token,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class F, class... Args>
+    auto try_submit_token(
+        CancellationToken token,
+        F&& f,
+        Args&&... args
+    )
+        -> std::optional<
+            std::future<
+                std::invoke_result_t<F, Args...>
+            >
+        >;
+
+
+    template <class F, class... Args>
+    auto submit_at_token(
+        std::chrono::steady_clock::time_point at,
+        CancellationToken token,
+        F&& f,
+        Args&&... args
+    )
+        -> std::future<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class Rep, class Period, class F, class... Args>
+    auto submit_after_token(
+        const std::chrono::duration<Rep, Period>& delay,
+        CancellationToken token,
+        F&& f,
+        Args&&... args
+    )
+        -> std::future<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    // ============================================================
+    // Future continuation + batch submission (5.0.0)
+    // ============================================================
+
+    /**
+     * Chain a callable onto a future without blocking any thread.
+     *
+     * The continuation is submitted as a pool task; it runs once the
+     * predecessor is ready. Both value and void futures are supported.
+     * If the predecessor throws, the continuation's future carries that
+     * exception and fn is not invoked.
+     */
+    template <class T, class F>
+    auto then(
+        std::future<T> future,
+        F&& f
+    )
+        -> std::future<
+            typename threadpool_detail::ThenResult<
+                T,
+                F
+            >::type
+        >;
+
+
+    /**
+     * Submit count tasks, each invoked as f(index), and return their
+     * futures in index order. Same priority and rejection semantics as
+     * individual submit() calls.
+     */
+    template <class F>
+    auto submit_batch(
+        std::size_t count,
+        F&& f
+    )
+        -> std::vector<
+            std::future<
+                std::invoke_result_t<F, std::size_t>
+            >
+        >;
+
+
+    template <class F>
+    auto submit_batch_priority(
+        int priority,
+        std::size_t count,
+        F&& f
+    )
+        -> std::vector<
+            std::future<
+                std::invoke_result_t<F, std::size_t>
+            >
+        >;
+
+
+    // ============================================================
     // Future composition (4.0.0)
     // ============================================================
 
@@ -1006,6 +1402,16 @@ private:
 
         std::shared_ptr<std::atomic<TaskState>> state;
 
+        /*
+         * 5.0.0: the cancellation domain this task belongs to. Empty for
+         * tasks submitted through the classic API.
+         *
+         * It lives on the queue entry (not just inside the lambda) so that
+         * run_task() can install it in the thread-local execution context
+         * before invoking func, on every execution path.
+         */
+        CancellationToken token;
+
         std::function<void()> func;
     };
 
@@ -1220,6 +1626,25 @@ private:
 
 
     /*
+     * The real submission engine since 5.0.0. do_submit() forwards here
+     * with an empty token, so the classic API keeps its exact behaviour
+     * while submit_token() can attach a cancellation domain.
+     */
+    template <class F, class... Args>
+    auto do_submit_token(
+        int priority,
+        CancellationToken token,
+        bool allow_wait,
+        SubmitResult& status,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    /*
      * Builds the Task, its future and its cancellation handle without
      * touching any queue.
      *
@@ -1240,6 +1665,25 @@ private:
     template <class F, class... Args>
     auto do_schedule_at(
         int priority,
+        bool allow_wait,
+        SubmitResult& status,
+        std::chrono::steady_clock::time_point at,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    /*
+     * Token-aware counterpart of do_schedule_at(); the classic path
+     * forwards to it with an empty token.
+     */
+    template <class F, class... Args>
+    auto do_schedule_at_token(
+        int priority,
+        CancellationToken token,
         bool allow_wait,
         SubmitResult& status,
         std::chrono::steady_clock::time_point at,
@@ -1510,6 +1954,16 @@ private:
     std::atomic<std::uint64_t> running_{0};
 
     std::atomic<std::uint64_t> stolen_{0};
+
+
+    /*
+     * 5.0.0 counters. failed_ is incremented by the task wrapper itself,
+     * before std::packaged_task stores the exception in the future, so a
+     * caller that never calls get() still leaves a trace in the metrics.
+     */
+    std::atomic<std::uint64_t> failed_{0};
+
+    std::atomic<std::uint64_t> token_cancelled_{0};
 };
 
 
@@ -1783,8 +2237,9 @@ bool ThreadPool::wait_until(
 // ============================================================
 
 template <class F, class... Args>
-auto ThreadPool::do_submit(
+auto ThreadPool::do_submit_token(
     int priority,
+    CancellationToken token,
     bool allow_wait,
     SubmitResult& status,
     F&& f,
@@ -1826,10 +2281,18 @@ auto ThreadPool::do_submit(
      *
      * std::apply invokes through std::invoke, so member function pointers
      * are supported as well.
+     *
+     * 5.0.0: the cancellation token is captured here (inside the
+     * packaged_task callable) as well as on the queue entry. Throwing
+     * before the user callable is entered lets packaged_task deliver
+     * TaskCancelled through the future; the outer wrapper only has to
+     * update the state and the counters.
      */
     auto body =
         std::make_shared<Body>(
             [
+                this,
+                token,
                 callable =
                     Callable(
                         std::forward<F>(f)
@@ -1840,21 +2303,41 @@ auto ThreadPool::do_submit(
                     )
             ]() mutable -> ReturnType
             {
-                if constexpr(
-                    std::is_void_v<ReturnType>
-                )
+                token.throw_if_cancelled();
+
+
+                try
                 {
-                    std::apply(
-                        std::move(callable),
-                        std::move(bound)
-                    );
+                    if constexpr(
+                        std::is_void_v<ReturnType>
+                    )
+                    {
+                        std::apply(
+                            std::move(callable),
+                            std::move(bound)
+                        );
+                    }
+                    else
+                    {
+                        return std::apply(
+                            std::move(callable),
+                            std::move(bound)
+                        );
+                    }
                 }
-                else
+                catch(...)
                 {
-                    return std::apply(
-                        std::move(callable),
-                        std::move(bound)
+                    /*
+                     * packaged_task will store this exception in the future.
+                     * Count it here too: callers that never call get() still
+                     * leave a trace in PoolMetrics.failed.
+                     */
+                    failed_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
                     );
+
+                    throw;
                 }
             }
         );
@@ -1899,8 +2382,10 @@ auto ThreadPool::do_submit(
      * usually fits into the std::function small buffer instead of
      * allocating.
      */
+    task.token = token;
+
     task.func =
-        [this, body]()
+        [this, body, token]()
         {
             std::atomic<TaskState>& state_ref =
                 body->state;
@@ -1945,6 +2430,16 @@ auto ThreadPool::do_submit(
             }
 
 
+            /*
+             * Read the token when the task actually starts. A cancellation
+             * that arrives while the task is queued is what we act on here;
+             * the packaged_task callable re-checks it a moment later and
+             * throws TaskCancelled before entering user code.
+             */
+            const bool cancelled =
+                token.is_cancelled();
+
+
             running_.fetch_add(
                 1,
                 std::memory_order_relaxed
@@ -1977,16 +2472,35 @@ auto ThreadPool::do_submit(
             );
 
 
-            state_ref.store(
-                TaskState::COMPLETED,
-                std::memory_order_release
-            );
+            if(cancelled)
+            {
+                token_cancelled_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
 
+                cancelled_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
 
-            completed_.fetch_add(
-                1,
-                std::memory_order_relaxed
-            );
+                state_ref.store(
+                    TaskState::CANCELLED,
+                    std::memory_order_release
+                );
+            }
+            else
+            {
+                state_ref.store(
+                    TaskState::COMPLETED,
+                    std::memory_order_release
+                );
+
+                completed_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
+            }
         };
 
 
@@ -2062,12 +2576,40 @@ auto ThreadPool::do_submit(
 
 
 // ============================================================
+// do_submit (classic API, forwards to the token-aware engine)
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::do_submit(
+    int priority,
+    bool allow_wait,
+    SubmitResult& status,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return do_submit_token(
+        priority,
+        CancellationToken{},
+        allow_wait,
+        status,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+// ============================================================
 // do_schedule_at
 // ============================================================
 
 template <class F, class... Args>
-auto ThreadPool::do_schedule_at(
+auto ThreadPool::do_schedule_at_token(
     int priority,
+    CancellationToken token,
     bool allow_wait,
     SubmitResult& status,
     std::chrono::steady_clock::time_point at,
@@ -2100,9 +2642,24 @@ auto ThreadPool::do_schedule_at(
     );
 
 
+    /*
+     * Deferred tasks are not subject to max_queue, so the BLOCK policy's
+     * allow_wait flag has nothing to do here. It is kept in the signature
+     * to mirror do_submit_token() and the public scheduling API.
+     */
+    (void)allow_wait;
+
+
+    /*
+     * Same cooperative-cancellation contract as the immediate path: a
+     * token cancelled before the deadline expires makes the future carry
+     * TaskCancelled instead of a value.
+     */
     auto body =
         std::make_shared<Body>(
             [
+                this,
+                token,
                 callable =
                     Callable(
                         std::forward<F>(f)
@@ -2113,21 +2670,36 @@ auto ThreadPool::do_schedule_at(
                     )
             ]() mutable -> ReturnType
             {
-                if constexpr(
-                    std::is_void_v<ReturnType>
-                )
+                token.throw_if_cancelled();
+
+
+                try
                 {
-                    std::apply(
-                        std::move(callable),
-                        std::move(bound)
-                    );
+                    if constexpr(
+                        std::is_void_v<ReturnType>
+                    )
+                    {
+                        std::apply(
+                            std::move(callable),
+                            std::move(bound)
+                        );
+                    }
+                    else
+                    {
+                        return std::apply(
+                            std::move(callable),
+                            std::move(bound)
+                        );
+                    }
                 }
-                else
+                catch(...)
                 {
-                    return std::apply(
-                        std::move(callable),
-                        std::move(bound)
+                    failed_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
                     );
+
+                    throw;
                 }
             }
         );
@@ -2160,8 +2732,10 @@ auto ThreadPool::do_schedule_at(
     task.state = state;
 
 
+    task.token = token;
+
     task.func =
-        [this, body]()
+        [this, body, token]()
         {
             std::atomic<TaskState>& state_ref =
                 body->state;
@@ -2192,6 +2766,10 @@ auto ThreadPool::do_schedule_at(
             }
 
 
+            const bool cancelled =
+                token.is_cancelled();
+
+
             running_.fetch_add(
                 1,
                 std::memory_order_relaxed
@@ -2213,16 +2791,35 @@ auto ThreadPool::do_schedule_at(
             );
 
 
-            state_ref.store(
-                TaskState::COMPLETED,
-                std::memory_order_release
-            );
+            if(cancelled)
+            {
+                token_cancelled_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
 
+                cancelled_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
 
-            completed_.fetch_add(
-                1,
-                std::memory_order_relaxed
-            );
+                state_ref.store(
+                    TaskState::CANCELLED,
+                    std::memory_order_release
+                );
+            }
+            else
+            {
+                state_ref.store(
+                    TaskState::COMPLETED,
+                    std::memory_order_release
+                );
+
+                completed_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
+            }
         };
 
 
@@ -2306,6 +2903,35 @@ auto ThreadPool::do_schedule_at(
         std::move(future),
         std::move(handle)
     };
+}
+
+
+// ============================================================
+// do_schedule_at (classic API, forwards to the token-aware engine)
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::do_schedule_at(
+    int priority,
+    bool allow_wait,
+    SubmitResult& status,
+    std::chrono::steady_clock::time_point at,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return do_schedule_at_token(
+        priority,
+        CancellationToken{},
+        allow_wait,
+        status,
+        at,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
 }
 
 
@@ -2882,6 +3508,817 @@ std::future<T> ThreadPool::parallel_reduce(
 
     return state->promise.get_future();
 }
+
+
+// ============================================================
+// submit_cancellable_token (5.0.0)
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::submit_cancellable_token(
+    int priority,
+    CancellationToken token,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_submit_token(
+        priority,
+        std::move(token),
+        true,
+        status,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status == SubmitResult::REJECTED_STOPPED)
+    {
+        throw std::runtime_error(
+            "ThreadPool already stopped"
+        );
+    }
+
+
+    if(status == SubmitResult::REJECTED_FULL)
+    {
+        throw std::runtime_error(
+            "ThreadPool queue full, task rejected"
+        );
+    }
+
+
+    return result;
+}
+
+
+// ============================================================
+// submit_token_priority / submit_token
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::submit_token_priority(
+    int priority,
+    CancellationToken token,
+    F&& f,
+    Args&&... args
+)
+    -> std::future<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    auto result = submit_cancellable_token(
+        priority,
+        std::move(token),
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    return std::move(result.future);
+}
+
+
+template <class F, class... Args>
+auto ThreadPool::submit_token(
+    CancellationToken token,
+    F&& f,
+    Args&&... args
+)
+    -> std::future<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return submit_token_priority(
+        0,
+        std::move(token),
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+// ============================================================
+// try_submit_token
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::try_submit_token(
+    CancellationToken token,
+    F&& f,
+    Args&&... args
+)
+    -> std::optional<
+        std::future<
+            std::invoke_result_t<F, Args...>
+        >
+    >
+{
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_submit_token(
+        0,
+        std::move(token),
+        false,
+        status,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status != SubmitResult::ACCEPTED
+        &&
+        status != SubmitResult::CALLER_RUNS)
+    {
+        return std::nullopt;
+    }
+
+
+    return std::move(result.future);
+}
+
+
+// ============================================================
+// submit_at_token / submit_after_token
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::submit_at_token(
+    std::chrono::steady_clock::time_point at,
+    CancellationToken token,
+    F&& f,
+    Args&&... args
+)
+    -> std::future<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    auto result = do_schedule_at_token(
+        0,
+        std::move(token),
+        true,
+        status,
+        at,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+
+
+    if(status == SubmitResult::REJECTED_STOPPED)
+    {
+        throw std::runtime_error(
+            "ThreadPool already stopped"
+        );
+    }
+
+
+    return std::move(result.future);
+}
+
+
+template <class Rep, class Period, class F, class... Args>
+auto ThreadPool::submit_after_token(
+    const std::chrono::duration<Rep, Period>& delay,
+    CancellationToken token,
+    F&& f,
+    Args&&... args
+)
+    -> std::future<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return submit_at_token(
+        std::chrono::steady_clock::now()
+            + delay,
+        std::move(token),
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+// ============================================================
+// then (5.0.0)
+// ============================================================
+
+template <class T, class F>
+auto ThreadPool::then(
+    std::future<T> future,
+    F&& f
+)
+    -> std::future<
+        typename threadpool_detail::ThenResult<
+            T,
+            F
+        >::type
+    >
+{
+    using R =
+        typename threadpool_detail::ThenResult<
+            T,
+            F
+        >::type;
+
+
+    /*
+     * Both captures are copyable: std::future is move-only, so it lives
+     * behind a shared_ptr for the same reason when_all() does - the
+     * packaged_task inside submit() requires a copyable callable.
+     */
+    auto predecessor =
+        std::make_shared<std::future<T>>(
+            std::move(future)
+        );
+
+    auto fn =
+        std::decay_t<F>(
+            std::forward<F>(f)
+        );
+
+
+    return submit(
+        [predecessor, fn]() mutable -> R
+        {
+            if constexpr(std::is_void_v<T>)
+            {
+                predecessor->get();
+
+                if constexpr(std::is_void_v<R>)
+                    fn();
+                else
+                    return fn();
+            }
+            else
+            {
+                T value = predecessor->get();
+
+                if constexpr(std::is_void_v<R>)
+                    fn(std::move(value));
+                else
+                    return fn(std::move(value));
+            }
+        }
+    );
+}
+
+
+// ============================================================
+// submit_batch (5.0.0)
+// ============================================================
+
+template <class F>
+auto ThreadPool::submit_batch_priority(
+    int priority,
+    std::size_t count,
+    F&& f
+)
+    -> std::vector<
+        std::future<
+            std::invoke_result_t<F, std::size_t>
+        >
+    >
+{
+    using R =
+        std::invoke_result_t<F, std::size_t>;
+
+
+    std::vector<std::future<R>> out;
+
+    out.reserve(count);
+
+
+    for(std::size_t i = 0; i < count; ++i)
+    {
+        out.emplace_back(
+            submit_priority(
+                priority,
+                f,
+                i
+            )
+        );
+    }
+
+
+    return out;
+}
+
+
+template <class F>
+auto ThreadPool::submit_batch(
+    std::size_t count,
+    F&& f
+)
+    -> std::vector<
+        std::future<
+            std::invoke_result_t<F, std::size_t>
+        >
+    >
+{
+    return submit_batch_priority(
+        0,
+        count,
+        std::forward<F>(f)
+    );
+}
+
+
+// ============================================================
+// TaskGroup - structured concurrency (5.0.0)
+// ============================================================
+
+enum class GroupDestroyPolicy
+{
+    WAIT,               // Destructor waits for every group task
+    CANCEL_AND_WAIT     // Destructor requests cancellation first
+};
+
+
+/**
+ * Thrown by TaskGroup::rethrow_exceptions() when at least one task failed.
+ *
+ * All exception objects are retained so a caller can inspect or rethrow
+ * each one individually; the first one is also available as the most
+ * common "just rethrow" case.
+ */
+class TaskGroupError : public std::runtime_error
+{
+public:
+    explicit TaskGroupError(
+        std::vector<std::exception_ptr> errors
+    )
+        : std::runtime_error(
+            "ThreadPool: task group finished with exceptions"
+        )
+        , errors_(std::move(errors))
+    {
+    }
+
+
+    const std::vector<std::exception_ptr>& errors() const
+    {
+        return errors_;
+    }
+
+
+    std::size_t size() const
+    {
+        return errors_.size();
+    }
+
+
+private:
+    std::vector<std::exception_ptr> errors_;
+};
+
+
+/**
+ * A group of tasks with a shared cancellation domain and its own wait().
+ *
+ * Unlike ThreadPool::wait(), which drains the entire pool, wait() here
+ * only waits for tasks submitted through this group. That makes it safe
+ * to use a long-lived pool with several independent concurrent groups.
+ *
+ * Every task runs as a normal pool task whose wrapper:
+ *
+ * - checks the group token before entering user code,
+ * - delivers a value or an exception to its own future,
+ * - records exceptions for rethrow_exceptions(),
+ * - decrements the group's pending count under all outcomes.
+ *
+ * The last point is why the wrapper performs the token check itself
+ * instead of using submit_token(): a skipped task would never run the
+ * wrapper, and the group's pending count could never reach zero.
+ *
+ * Note: wait()/wait_for()/wait_until() must be called from a thread that
+ * is not a worker of this (or any) pool - blocking a worker while its
+ * group still needs that worker is a deadlock. The destructor swallows
+ * that diagnostic, so create groups on an external thread.
+ */
+class TaskGroup
+{
+public:
+    explicit TaskGroup(
+        ThreadPool& pool,
+        GroupDestroyPolicy policy =
+            GroupDestroyPolicy::WAIT
+    )
+        : pool_(pool)
+        , policy_(policy)
+        , state_(std::make_shared<State>())
+    {
+    }
+
+
+    ~TaskGroup()
+    {
+        if(policy_
+            == GroupDestroyPolicy::CANCEL_AND_WAIT)
+        {
+            request_cancel();
+        }
+
+
+        try
+        {
+            wait();
+        }
+        catch(...)
+        {
+            /*
+             * A destructor must not throw. On a worker thread this is the
+             * deadlock guard described above; the group state stays alive
+             * through shared_ptr until its tasks finish.
+             */
+        }
+    }
+
+
+    TaskGroup(const TaskGroup&) = delete;
+
+    TaskGroup& operator=(const TaskGroup&) = delete;
+
+    TaskGroup(TaskGroup&&) = delete;
+
+    TaskGroup& operator=(TaskGroup&&) = delete;
+
+
+    template <class F, class... Args>
+    auto submit(
+        F&& f,
+        Args&&... args
+    )
+        -> std::future<
+            std::invoke_result_t<F, Args...>
+        >
+    {
+        return submit_priority(
+            0,
+            std::forward<F>(f),
+            std::forward<Args>(args)...
+        );
+    }
+
+
+    template <class F, class... Args>
+    auto submit_priority(
+        int priority,
+        F&& f,
+        Args&&... args
+    )
+        -> std::future<
+            std::invoke_result_t<F, Args...>
+        >
+    {
+        using R =
+            std::invoke_result_t<F, Args...>;
+
+        using Callable =
+            std::decay_t<F>;
+
+        using ArgsTuple =
+            std::tuple<std::decay_t<Args>...>;
+
+
+        static_assert(
+            std::is_invocable_v<
+                Callable&,
+                std::decay_t<Args>...
+            >,
+            "TaskGroup: callable is not invocable with the given arguments"
+        );
+
+
+        auto promise =
+            std::make_shared<std::promise<R>>();
+
+        auto future =
+            promise->get_future();
+
+        auto token =
+            state_->source.token();
+
+
+        {
+            std::lock_guard<std::mutex> lock(
+                state_->mtx
+            );
+
+            state_->source.throw_if_cancelled();
+
+            ++state_->pending;
+            ++state_->submitted;
+        }
+
+
+        try
+        {
+            pool_.submit_priority(
+                priority,
+                [
+                    group = state_,
+                    promise,
+                    token,
+                    callable =
+                        Callable(
+                            std::forward<F>(f)
+                        ),
+                    bound =
+                        ArgsTuple(
+                            std::forward<Args>(args)...
+                        )
+                ]() mutable
+                {
+                    try
+                    {
+                        token.throw_if_cancelled();
+
+
+                        if constexpr(std::is_void_v<R>)
+                        {
+                            std::apply(
+                                std::move(callable),
+                                std::move(bound)
+                            );
+
+                            promise->set_value();
+                        }
+                        else
+                        {
+                            promise->set_value(
+                                std::apply(
+                                    std::move(callable),
+                                    std::move(bound)
+                                )
+                            );
+                        }
+                    }
+                    catch(...)
+                    {
+                        std::exception_ptr ep =
+                            std::current_exception();
+
+
+                        try
+                        {
+                            promise->set_exception(ep);
+                        }
+                        catch(...)
+                        {
+                            /*
+                             * A promise can only be fulfilled once; a
+                             * broken group must not kill the worker.
+                             */
+                        }
+
+
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                group->mtx
+                            );
+
+                            ++group->failed;
+
+                            group->errors.push_back(ep);
+                        }
+                    }
+
+
+                    finish_one(group);
+                }
+            );
+        }
+        catch(...)
+        {
+            /*
+             * submit_priority() can throw (stopped pool, full queue). The
+             * task will never run, so undo the pending increment here or
+             * wait() would hang forever.
+             */
+            finish_one(state_);
+
+            throw;
+        }
+
+
+        return future;
+    }
+
+
+    /** Request cancellation of every not-yet-started task in the group. */
+    bool request_cancel()
+    {
+        return state_->source.request_cancel();
+    }
+
+
+    bool is_cancelled() const
+    {
+        return state_->source.is_cancelled();
+    }
+
+
+    CancellationToken token() const
+    {
+        return state_->source.token();
+    }
+
+
+    void wait()
+    {
+        ensure_external_thread();
+
+
+        std::unique_lock<std::mutex> lock(
+            state_->mtx
+        );
+
+        state_->cv.wait(
+            lock,
+            [this]()
+            {
+                return state_->pending == 0;
+            }
+        );
+    }
+
+
+    template <class Rep, class Period>
+    bool wait_for(
+        const std::chrono::duration<
+            Rep,
+            Period
+        >& timeout
+    )
+    {
+        ensure_external_thread();
+
+
+        std::unique_lock<std::mutex> lock(
+            state_->mtx
+        );
+
+        return state_->cv.wait_for(
+            lock,
+            timeout,
+            [this]()
+            {
+                return state_->pending == 0;
+            }
+        );
+    }
+
+
+    template <class Clock, class Duration>
+    bool wait_until(
+        const std::chrono::time_point<
+            Clock,
+            Duration
+        >& deadline
+    )
+    {
+        ensure_external_thread();
+
+
+        std::unique_lock<std::mutex> lock(
+            state_->mtx
+        );
+
+        return state_->cv.wait_until(
+            lock,
+            deadline,
+            [this]()
+            {
+                return state_->pending == 0;
+            }
+        );
+    }
+
+
+    /** Rethrow all recorded task exceptions as one TaskGroupError. */
+    void rethrow_exceptions()
+    {
+        std::vector<std::exception_ptr> errors;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                state_->mtx
+            );
+
+            errors = state_->errors;
+        }
+
+
+        if(!errors.empty())
+            throw TaskGroupError(std::move(errors));
+    }
+
+
+    std::vector<std::exception_ptr> errors() const
+    {
+        std::lock_guard<std::mutex> lock(
+            state_->mtx
+        );
+
+        return state_->errors;
+    }
+
+
+    std::size_t pending() const
+    {
+        std::lock_guard<std::mutex> lock(
+            state_->mtx
+        );
+
+        return state_->pending;
+    }
+
+
+    std::size_t submitted() const
+    {
+        std::lock_guard<std::mutex> lock(
+            state_->mtx
+        );
+
+        return state_->submitted;
+    }
+
+
+    std::size_t failed() const
+    {
+        std::lock_guard<std::mutex> lock(
+            state_->mtx
+        );
+
+        return state_->failed;
+    }
+
+
+private:
+    struct State
+    {
+        mutable std::mutex mtx;
+
+        std::condition_variable cv;
+
+        std::size_t pending = 0;
+
+        std::size_t submitted = 0;
+
+        std::size_t failed = 0;
+
+        std::vector<std::exception_ptr> errors;
+
+        CancellationSource source;
+    };
+
+
+    static void finish_one(
+        const std::shared_ptr<State>& state
+    )
+    {
+        std::lock_guard<std::mutex> lock(
+            state->mtx
+        );
+
+        --state->pending;
+
+        if(state->pending == 0)
+            state->cv.notify_all();
+    }
+
+
+    static void ensure_external_thread()
+    {
+        if(ThreadPool::current_worker_id()
+            != ThreadPool::no_worker)
+        {
+            throw std::logic_error(
+                "TaskGroup::wait() called from a worker thread"
+            );
+        }
+    }
+
+
+private:
+    ThreadPool& pool_;
+
+    GroupDestroyPolicy policy_;
+
+    std::shared_ptr<State> state_;
+};
 
 
 #endif
