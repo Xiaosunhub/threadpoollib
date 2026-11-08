@@ -50,12 +50,18 @@
  * (clear, stop(IMMEDIATE), handle.cancel) now release TaskGroup
  * bookkeeping and fulfil its futures instead of hanging wait(). Group
  * tasks also see their token through ThreadPool::current_token().
+ *
+ * 5.1.0 adds lazy deadlines to cancellation domains (cancel_after /
+ * cancel_at, no timer thread), deadline-bound submissions
+ * (submit_with_timeout / submit_with_deadline and priority variants),
+ * TaskGroup::cancel_after / cancel_at, and the PoolMetrics.timed_out
+ * counter.
  */
 #define THREADPOOL_VERSION_MAJOR 5
-#define THREADPOOL_VERSION_MINOR 0
-#define THREADPOOL_VERSION_PATCH 1
+#define THREADPOOL_VERSION_MINOR 1
+#define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "5.0.1"
+#define THREADPOOL_VERSION_STRING "5.1.0"
 
 
 enum class PoolStopMode
@@ -126,7 +132,48 @@ namespace threadpool_detail
     struct CancellationState
     {
         std::atomic<bool> flag{false};
+
+
+        /*
+         * Deadline expressed in steady_clock ticks since its epoch; 0
+         * means "no deadline".
+         *
+         * A deadline is evaluated lazily by whoever asks is_cancelled().
+         * No timer thread, no callbacks and no cleanup are needed: the
+         * state is kept alive by the tokens themselves, so a task that
+         * starts after its deadline simply observes it.
+         */
+        std::atomic<
+            std::chrono::steady_clock::rep
+        > deadline{0};
     };
+
+
+    /*
+     * Returns true only when a deadline exists and has passed.
+     *
+     * The zero check happens before reading the clock, so domains with no
+     * deadline never pay for a steady_clock::now() call.
+     */
+    inline bool deadline_reached(
+        const CancellationState& state
+    )
+    {
+        const std::chrono::steady_clock::rep ticks =
+            state.deadline.load(
+                std::memory_order_acquire
+            );
+
+
+        if(ticks == 0)
+            return false;
+
+
+        return std::chrono::steady_clock::now()
+            .time_since_epoch()
+            .count()
+            >= ticks;
+    }
 
 
     /*
@@ -190,8 +237,14 @@ public:
  * false and every check is a single pointer test. Tokens are obtained
  * from CancellationSource::token() or TaskGroup::token().
  *
+ * A cancellation domain can also carry a deadline (5.1.0). Deadlines are
+ * evaluated lazily at each check, so passing time cancels the domain
+ * without any timer thread; timed_out() tells a deadline apart from an
+ * explicit request_cancel().
+ *
  * This is cooperative cancellation, not thread termination: a task that
- * never checks its token will run to completion even after a request.
+ * never checks its token will run to completion even after a request or
+ * a deadline.
  */
 class CancellationToken
 {
@@ -203,16 +256,75 @@ public:
     {
         return state_
             &&
-            state_->flag.load(
+            (state_->flag.load(
+                std::memory_order_acquire
+            )
+                ||
+                threadpool_detail::deadline_reached(
+                    *state_
+                ));
+    }
+
+
+    /*
+     * True only when the domain was cancelled by its deadline rather than
+     * by an explicit request_cancel().
+     */
+    bool timed_out() const
+    {
+        return state_
+            &&
+            !state_->flag.load(
+                std::memory_order_acquire
+            )
+            &&
+            threadpool_detail::deadline_reached(
+                *state_
+            );
+    }
+
+
+    /*
+     * Returns the domain's deadline, or a default-constructed time_point
+     * when there is none.
+     */
+    std::chrono::steady_clock::time_point deadline() const
+    {
+        if(!state_)
+            return std::chrono::steady_clock::time_point{};
+
+
+        const std::chrono::steady_clock::rep ticks =
+            state_->deadline.load(
                 std::memory_order_acquire
             );
+
+
+        if(ticks == 0)
+            return std::chrono::steady_clock::time_point{};
+
+
+        return std::chrono::steady_clock::time_point{
+            std::chrono::steady_clock::duration{ticks}
+        };
     }
 
 
     void throw_if_cancelled() const
     {
-        if(is_cancelled())
-            throw TaskCancelled();
+        if(!is_cancelled())
+            return;
+
+
+        if(timed_out())
+        {
+            throw TaskCancelled(
+                "ThreadPool: task timed out"
+            );
+        }
+
+
+        throw TaskCancelled();
     }
 
 
@@ -254,6 +366,11 @@ private:
  *
  * request_cancel() is idempotent and thread-safe; it returns true only
  * for the caller that actually flipped the flag from false to true.
+ *
+ * Since 5.1.0 a domain can also be given a deadline with cancel_after()
+ * or cancel_at(). No timer thread is involved: is_cancelled() compares
+ * the clock lazily, so a task that has not started yet sees the expiry
+ * the moment its wrapper checks the token.
  */
 class CancellationSource
 {
@@ -286,18 +403,122 @@ public:
     }
 
 
+    /*
+     * Arm a deadline relative to now. Repeated calls keep the earliest
+     * deadline, which is the only update that cannot weaken a guarantee
+     * already promised to a token holder.
+     */
+    template <class Rep, class Period>
+    void cancel_after(
+        const std::chrono::duration<Rep, Period>& delay
+    )
+    {
+        const auto ticks =
+            std::chrono::duration_cast<
+                std::chrono::steady_clock::duration
+            >(delay).count();
+
+
+        set_deadline_ticks(
+            std::chrono::steady_clock::now()
+                .time_since_epoch()
+                .count()
+            + ticks
+        );
+    }
+
+
+    void cancel_at(
+        std::chrono::steady_clock::time_point at
+    )
+    {
+        set_deadline_ticks(
+            at.time_since_epoch().count()
+        );
+    }
+
+
     bool is_cancelled() const
     {
         return state_->flag.load(
-            std::memory_order_acquire
-        );
+                std::memory_order_acquire
+            )
+            ||
+            threadpool_detail::deadline_reached(
+                *state_
+            );
+    }
+
+
+    /*
+     * True only when a deadline, rather than request_cancel(), cancelled
+     * this domain.
+     */
+    bool timed_out() const
+    {
+        return !state_->flag.load(
+                std::memory_order_acquire
+            )
+            &&
+            threadpool_detail::deadline_reached(
+                *state_
+            );
     }
 
 
     void throw_if_cancelled() const
     {
-        if(is_cancelled())
-            throw TaskCancelled();
+        if(!is_cancelled())
+            return;
+
+
+        if(timed_out())
+        {
+            throw TaskCancelled(
+                "ThreadPool: task timed out"
+            );
+        }
+
+
+        throw TaskCancelled();
+    }
+
+
+private:
+    /*
+     * Compare-and-swap loop: an existing earlier deadline always wins.
+     */
+    void set_deadline_ticks(
+        std::chrono::steady_clock::rep ticks
+    )
+    {
+        /*
+         * Zero is reserved for "no deadline". A non-positive deadline
+         * means "already expired", so clamp it to the first tick of the
+         * epoch instead of accidentally disarming the domain.
+         */
+        if(ticks < 1)
+            ticks = 1;
+
+
+        std::chrono::steady_clock::rep current =
+            state_->deadline.load(
+                std::memory_order_relaxed
+            );
+
+
+        while((current == 0
+                ||
+                ticks < current)
+            &&
+            !state_->deadline.compare_exchange_weak(
+                current,
+                ticks,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed
+            ))
+        {
+        }
     }
 
 
@@ -444,6 +665,14 @@ struct PoolMetrics
     std::uint64_t failed = 0;
 
     std::uint64_t token_cancelled = 0;
+
+
+    /*
+     * 5.1.0 diagnostic: tasks that were already expired by their
+     * cancellation deadline when the worker picked them up. A subset of
+     * token_cancelled, not an additional total.
+     */
+    std::uint64_t timed_out = 0;
 
 
     /*
@@ -1079,6 +1308,73 @@ public:
         Args&&... args
     )
         -> std::future<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    // ============================================================
+    // Deadline-bound submissions (5.1.0)
+    // ============================================================
+
+    /**
+     * Submit a task with its own cancellation deadline.
+     *
+     * The pool creates a private CancellationSource, arms it with the
+     * given deadline and submits through submit_cancellable_token(). If
+     * the deadline has passed before the task starts, the callable is
+     * skipped and the future throws TaskCancelled (with a "timed out"
+     * message). A running task can observe the same deadline through
+     * ThreadPool::current_token().throw_if_cancelled().
+     *
+     * Returns a TaskResult, so the caller still gets a TaskHandle for an
+     * individual early cancel() on top of the automatic deadline.
+     *
+     * This is deliberately lazy: no timer thread is created and nothing
+     * is woken at expiry. A task that never checks its token simply runs
+     * to completion, exactly like any other cooperative cancellation.
+     */
+    template <class Rep, class Period, class F, class... Args>
+    auto submit_with_timeout(
+        const std::chrono::duration<Rep, Period>& timeout,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class F, class... Args>
+    auto submit_with_deadline(
+        std::chrono::steady_clock::time_point deadline,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class Rep, class Period, class F, class... Args>
+    auto submit_with_timeout_priority(
+        int priority,
+        const std::chrono::duration<Rep, Period>& timeout,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
+            std::invoke_result_t<F, Args...>
+        >;
+
+
+    template <class F, class... Args>
+    auto submit_with_deadline_priority(
+        int priority,
+        std::chrono::steady_clock::time_point deadline,
+        F&& f,
+        Args&&... args
+    )
+        -> TaskResult<
             std::invoke_result_t<F, Args...>
         >;
 
@@ -2020,6 +2316,8 @@ private:
     std::atomic<std::uint64_t> failed_{0};
 
     std::atomic<std::uint64_t> token_cancelled_{0};
+
+    std::atomic<std::uint64_t> timed_out_{0};
 };
 
 
@@ -2540,6 +2838,22 @@ auto ThreadPool::do_submit_token_ex(
 
             if(cancelled)
             {
+                /*
+                 * A deadline-driven cancellation is still a cancellation,
+                 * but callers tuning timeout budgets need to see it
+                 * separately. This counts tasks that were already expired
+                 * when they started; a deadline reached while a task is
+                 * running is only observable to that task itself.
+                 */
+                if(token.timed_out())
+                {
+                    timed_out_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                }
+
+
                 token_cancelled_.fetch_add(
                     1,
                     std::memory_order_relaxed
@@ -2889,6 +3203,22 @@ auto ThreadPool::do_schedule_at_token(
 
             if(cancelled)
             {
+                /*
+                 * A deadline-driven cancellation is still a cancellation,
+                 * but callers tuning timeout budgets need to see it
+                 * separately. This counts tasks that were already expired
+                 * when they started; a deadline reached while a task is
+                 * running is only observable to that task itself.
+                 */
+                if(token.timed_out())
+                {
+                    timed_out_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                }
+
+
                 token_cancelled_.fetch_add(
                     1,
                     std::memory_order_relaxed
@@ -3702,6 +4032,103 @@ auto ThreadPool::submit_token(
 
 
 // ============================================================
+// submit_with_deadline_priority / submit_with_timeout_priority (5.1.0)
+// ============================================================
+
+template <class F, class... Args>
+auto ThreadPool::submit_with_deadline_priority(
+    int priority,
+    std::chrono::steady_clock::time_point deadline,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    /*
+     * The source is a local, but the token holds the shared state. Every
+     * queued task keeps that state alive until its wrapper has run, so
+     * the deadline outlives this function without any registry.
+     */
+    CancellationSource source;
+
+    source.cancel_at(deadline);
+
+
+    return submit_cancellable_token(
+        priority,
+        source.token(),
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <class Rep, class Period, class F, class... Args>
+auto ThreadPool::submit_with_timeout_priority(
+    int priority,
+    const std::chrono::duration<Rep, Period>& timeout,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    CancellationSource source;
+
+    source.cancel_after(timeout);
+
+
+    return submit_cancellable_token(
+        priority,
+        source.token(),
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <class F, class... Args>
+auto ThreadPool::submit_with_deadline(
+    std::chrono::steady_clock::time_point deadline,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return submit_with_deadline_priority(
+        0,
+        deadline,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <class Rep, class Period, class F, class... Args>
+auto ThreadPool::submit_with_timeout(
+    const std::chrono::duration<Rep, Period>& timeout,
+    F&& f,
+    Args&&... args
+)
+    -> TaskResult<
+        std::invoke_result_t<F, Args...>
+    >
+{
+    return submit_with_timeout_priority(
+        0,
+        timeout,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+// ============================================================
 // try_submit_token
 // ============================================================
 
@@ -4288,6 +4715,38 @@ public:
     bool request_cancel()
     {
         return state_->source.request_cancel();
+    }
+
+
+    /*
+     * Arm a group-wide deadline (5.1.0). Every task submitted before the
+     * deadline shares the domain; tasks that have not started when it
+     * expires complete with TaskCancelled, while running tasks can check
+     * ThreadPool::current_token().
+     *
+     * Unlike wait_for() this does not block the caller and does not
+     * abandon the group: wait() still drains every task's bookkeeping.
+     */
+    template <class Rep, class Period>
+    void cancel_after(
+        const std::chrono::duration<Rep, Period>& delay
+    )
+    {
+        state_->source.cancel_after(delay);
+    }
+
+
+    void cancel_at(
+        std::chrono::steady_clock::time_point at
+    )
+    {
+        state_->source.cancel_at(at);
+    }
+
+
+    bool timed_out() const
+    {
+        return state_->source.timed_out();
     }
 
 

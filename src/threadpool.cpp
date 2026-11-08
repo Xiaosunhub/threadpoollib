@@ -1952,6 +1952,12 @@ PoolMetrics ThreadPool::get_metrics() const
         );
 
 
+    metrics.timed_out =
+        timed_out_.load(
+            std::memory_order_relaxed
+        );
+
+
     return metrics;
 }
 

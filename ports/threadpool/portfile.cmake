@@ -5,7 +5,7 @@ vcpkg_check_linkage(
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO Xiaosunhub/threadpoollib
-    REF v5.0.1
+    REF v5.1.0
     SHA512  5e47aab8686d9f110e6e633ae3f436bfd973eaa124547ca39a50a8986981d144a1e192a71ccf1d4745b3a08849b4fc1adf31e5092036e7ed266ffbdfae00b0ec
     HEAD_REF main
 )

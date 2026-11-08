@@ -2940,6 +2940,528 @@ void test_v501_discard_and_context()
 }
 
 
+void test_v510_deadlines()
+{
+    using clock = std::chrono::steady_clock;
+
+
+    /* A default token has neither a flag nor a deadline. */
+    {
+        CancellationToken token;
+
+        expect(
+            !token.cancellable()
+                &&
+            !token.is_cancelled()
+                &&
+            !token.timed_out()
+                &&
+            token.deadline()
+                == clock::time_point{},
+            "v5.1 deadline: default token stays inert"
+        );
+    }
+
+
+    /* Deadlines are evaluated lazily: no timer thread is involved. */
+    {
+        CancellationSource source;
+
+        source.cancel_after(
+            std::chrono::milliseconds(40)
+        );
+
+        CancellationToken token = source.token();
+
+        expect(
+            !source.is_cancelled()
+                &&
+            !token.is_cancelled()
+                &&
+            token.deadline() > clock::now(),
+            "v5.1 deadline: not cancelled before expiry"
+        );
+
+
+        sleep_ms(90);
+
+        expect(
+            source.is_cancelled()
+                &&
+            token.is_cancelled()
+                &&
+            source.timed_out()
+                &&
+            token.timed_out(),
+            "v5.1 deadline: expires lazily on check"
+        );
+
+
+        bool message_ok = false;
+
+        try
+        {
+            token.throw_if_cancelled();
+        }
+        catch(const TaskCancelled& e)
+        {
+            message_ok =
+                std::string(e.what()).find(
+                    "timed out"
+                ) != std::string::npos;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            message_ok,
+            "v5.1 deadline: TaskCancelled reports timeout"
+        );
+    }
+
+
+    /* An explicit request_cancel() is not reported as a timeout. */
+    {
+        CancellationSource source;
+
+        source.request_cancel();
+
+        bool message_ok = false;
+
+        try
+        {
+            source.token().throw_if_cancelled();
+        }
+        catch(const TaskCancelled& e)
+        {
+            message_ok =
+                !source.timed_out()
+                    &&
+                std::string(e.what()).find(
+                    "timed out"
+                ) == std::string::npos;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            message_ok,
+            "v5.1 deadline: explicit cancel is not a timeout"
+        );
+    }
+
+
+    /* Repeated cancel_at() calls keep the earliest deadline. */
+    {
+        CancellationSource source;
+
+        const auto now = clock::now();
+
+        source.cancel_at(
+            now + std::chrono::seconds(10)
+        );
+
+        source.cancel_at(
+            now + std::chrono::milliseconds(20)
+        );
+
+        CancellationToken token = source.token();
+
+        expect(
+            token.deadline()
+                < now + std::chrono::seconds(1),
+            "v5.1 deadline: earliest cancel_at wins"
+        );
+
+
+        sleep_ms(60);
+
+        expect(
+            token.is_cancelled(),
+            "v5.1 deadline: earlier deadline expires"
+        );
+    }
+
+
+    /* Deadline-bound submissions that still have time simply run. */
+    {
+        ThreadPool pool;
+
+        auto quick =
+            pool.submit_with_timeout(
+                std::chrono::seconds(5),
+                [](int x)
+                {
+                    return x * 2;
+                },
+                21
+            );
+
+        auto absolute =
+            pool.submit_with_deadline(
+                clock::now() + std::chrono::seconds(5),
+                []()
+                {
+                    return 9;
+                }
+            );
+
+        auto priority =
+            pool.submit_with_timeout_priority(
+                3,
+                std::chrono::seconds(5),
+                []()
+                {
+                    return 11;
+                }
+            );
+
+        auto priority_at =
+            pool.submit_with_deadline_priority(
+                3,
+                clock::now() + std::chrono::seconds(5),
+                []()
+                {
+                    return 13;
+                }
+            );
+
+
+        expect(
+            quick.future.get() == 42
+                &&
+            absolute.future.get() == 9
+                &&
+            priority.future.get() == 11
+                &&
+            priority_at.future.get() == 13,
+            "v5.1 deadline: unexpired tasks run normally"
+        );
+
+
+        expect(
+            quick.handle.valid()
+                &&
+            absolute.handle.valid(),
+            "v5.1 deadline: result still carries a TaskHandle"
+        );
+
+        pool.wait();
+    }
+
+
+    /* An already-expired deadline skips the callable entirely. */
+    {
+        ThreadPool pool;
+
+        auto task =
+            pool.submit_with_deadline(
+                clock::now()
+                    - std::chrono::seconds(1),
+                []()
+                {
+                    return 1;
+                }
+            );
+
+        bool ok = false;
+
+        try
+        {
+            (void)task.future.get();
+        }
+        catch(const TaskCancelled& e)
+        {
+            ok =
+                std::string(e.what()).find(
+                    "timed out"
+                ) != std::string::npos;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            ok,
+            "v5.1 deadline: expired task future carries timeout"
+        );
+
+
+        expect(
+            pool.get_metrics().timed_out >= 1
+                &&
+            pool.get_metrics().token_cancelled >= 1,
+            "v5.1 deadline: timed_out metric is recorded"
+        );
+
+        pool.wait();
+    }
+
+
+    /* A task queued behind a blocker expires before it can start. */
+    {
+        ThreadPool::Config cfg;
+
+        cfg.min_threads = 1;
+        cfg.max_threads = 1;
+
+        ThreadPool pool(cfg);
+
+        std::promise<void> started;
+        std::promise<void> release;
+
+        auto started_future = started.get_future();
+
+        /*
+         * shared_future is copyable: MSVC rejects an implicit capture of
+         * a move-only std::future<void> inside the submitted callable.
+         */
+        std::shared_future<void> release_future =
+            release.get_future().share();
+
+        auto blocker =
+            pool.submit(
+                [&started, release_future]()
+                {
+                    started.set_value();
+
+                    release_future.wait();
+                }
+            );
+
+        started_future.wait();
+
+
+        auto queued =
+            pool.submit_with_timeout(
+                std::chrono::milliseconds(30),
+                []()
+                {
+                    return 7;
+                }
+            );
+
+        sleep_ms(90);
+
+        release.set_value();
+
+        blocker.get();
+
+
+        bool ok = false;
+
+        try
+        {
+            (void)queued.future.get();
+        }
+        catch(const TaskCancelled&)
+        {
+            ok = true;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            ok,
+            "v5.1 deadline: queued task expires before start"
+        );
+
+        pool.wait();
+    }
+
+
+    /* A running task can observe its own deadline through the context. */
+    {
+        ThreadPool pool;
+
+        auto task =
+            pool.submit_with_timeout(
+                std::chrono::milliseconds(30),
+                []()
+                {
+                    for(int i = 0; i < 100; ++i)
+                    {
+                        sleep_ms(3);
+
+                        ThreadPool::current_token()
+                            .throw_if_cancelled();
+                    }
+
+                    return 1;
+                }
+            );
+
+        bool ok = false;
+
+        try
+        {
+            (void)task.future.get();
+        }
+        catch(const TaskCancelled&)
+        {
+            ok = true;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            ok,
+            "v5.1 deadline: running task sees current_token"
+        );
+
+        pool.wait();
+    }
+
+
+    /* Group-wide deadlines cancel queued members without hanging wait(). */
+    {
+        ThreadPool::Config cfg;
+
+        cfg.min_threads = 1;
+        cfg.max_threads = 1;
+
+        ThreadPool pool(cfg);
+
+        std::promise<void> started;
+        std::promise<void> release;
+
+        auto started_future = started.get_future();
+
+        /*
+         * shared_future is copyable: MSVC rejects an implicit capture of
+         * a move-only std::future<void> inside the submitted callable.
+         */
+        std::shared_future<void> release_future =
+            release.get_future().share();
+
+        auto blocker =
+            pool.submit(
+                [&started, release_future]()
+                {
+                    started.set_value();
+
+                    release_future.wait();
+                }
+            );
+
+        started_future.wait();
+
+
+        auto group =
+            std::make_unique<TaskGroup>(pool);
+
+        auto a = group->submit(
+            []()
+            {
+                return 1;
+            }
+        );
+
+        auto b = group->submit(
+            []()
+            {
+                return 2;
+            }
+        );
+
+        group->cancel_after(
+            std::chrono::milliseconds(20)
+        );
+
+        sleep_ms(80);
+
+        release.set_value();
+
+        blocker.get();
+
+
+        const bool drained =
+            group->wait_for(
+                std::chrono::seconds(2)
+            );
+
+        expect(
+            drained
+                &&
+            group->pending() == 0
+                &&
+            group->is_cancelled()
+                &&
+            group->timed_out(),
+            "v5.1 deadline: group cancel_after drains pending"
+        );
+
+
+        int cancelled_count = 0;
+
+        std::future<int>* futures[] = {&a, &b};
+
+        for(auto* f : futures)
+        {
+            try
+            {
+                (void)f->get();
+            }
+            catch(const TaskCancelled&)
+            {
+                ++cancelled_count;
+            }
+            catch(...)
+            {
+            }
+        }
+
+        expect(
+            cancelled_count == 2
+                &&
+            group->errors().size() == 2,
+            "v5.1 deadline: group futures carry TaskCancelled"
+        );
+
+
+        /* Never let a regression hang the whole test process. */
+        if(!drained)
+            group.release();
+
+        pool.wait();
+    }
+
+
+    /* A future deadline leaves a group's work untouched. */
+    {
+        ThreadPool pool;
+
+        TaskGroup group(pool);
+
+        group.cancel_at(
+            clock::now() + std::chrono::seconds(10)
+        );
+
+        auto f = group.submit(
+            []()
+            {
+                return 5;
+            }
+        );
+
+        expect(
+            f.get() == 5
+                &&
+            !group.is_cancelled()
+                &&
+            !group.timed_out(),
+            "v5.1 deadline: future group deadline is inert"
+        );
+
+        group.wait();
+    }
+}
+
+
 int main()
 {
     test_basics();
@@ -2979,6 +3501,8 @@ int main()
     test_v5_continuations_batches_and_groups();
 
     test_v501_discard_and_context();
+
+    test_v510_deadlines();
 
 
     std::printf(
