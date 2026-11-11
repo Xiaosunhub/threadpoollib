@@ -3462,6 +3462,250 @@ void test_v510_deadlines()
 }
 
 
+void test_v511_composition_hardening()
+{
+    /* Empty when_all() must be ready immediately, without a pool task. */
+    {
+        ThreadPool pool;
+
+        std::vector<std::future<int>> empty_values;
+
+        auto values =
+            pool.when_all(std::move(empty_values));
+
+        std::vector<std::future<void>> empty_voids;
+
+        auto voids =
+            pool.when_all(std::move(empty_voids));
+
+
+        expect(
+            values.wait_for(
+                std::chrono::milliseconds(0)
+            ) == std::future_status::ready
+                &&
+            values.get().empty()
+                &&
+            voids.wait_for(
+                std::chrono::milliseconds(0)
+            ) == std::future_status::ready,
+            "v5.1.1 when_all(empty) is ready without a worker"
+        );
+
+        voids.get();
+
+        pool.wait();
+    }
+
+
+    /* Discarded when_any() waiters must not strand the result future. */
+    {
+        ThreadPool::Config cfg;
+
+        cfg.min_threads = 1;
+        cfg.max_threads = 1;
+
+        ThreadPool pool(cfg);
+
+        std::promise<void> started;
+        std::promise<void> release;
+
+        auto started_future = started.get_future();
+
+        std::shared_future<void> release_future =
+            release.get_future().share();
+
+        auto blocker =
+            pool.submit(
+                [&started, release_future]()
+                {
+                    started.set_value();
+
+                    release_future.wait();
+                }
+            );
+
+        started_future.wait();
+
+
+        std::promise<int> p1;
+        std::promise<int> p2;
+
+        std::vector<std::future<int>> inputs;
+
+        inputs.push_back(p1.get_future());
+        inputs.push_back(p2.get_future());
+
+        auto any =
+            pool.when_any(std::move(inputs));
+
+        const std::size_t dropped =
+            pool.clear();
+
+        expect(
+            dropped >= 2,
+            "v5.1.1 clear() dropped the when_any waiters"
+        );
+
+
+        bool ok = false;
+
+        if(any.wait_for(
+            std::chrono::seconds(2)
+        ) == std::future_status::ready)
+        {
+            try
+            {
+                (void)any.get();
+            }
+            catch(const std::runtime_error&)
+            {
+                ok = true;
+            }
+            catch(...)
+            {
+            }
+        }
+
+        expect(
+            ok,
+            "v5.1.1 discarded when_any future completes with an error"
+        );
+
+
+        release.set_value();
+
+        blocker.get();
+
+        pool.wait();
+    }
+
+
+    /* stop(IMMEDIATE) discards void waiters the same way. */
+    {
+        ThreadPool::Config cfg;
+
+        cfg.min_threads = 1;
+        cfg.max_threads = 1;
+
+        ThreadPool pool(cfg);
+
+        std::promise<void> started;
+
+        auto started_future = started.get_future();
+
+
+        /*
+         * Occupy the only worker before submitting the waiters. Otherwise
+         * a waiter could start blocking on an input promise that is never
+         * fulfilled, leaving stop() with nothing to discard.
+         */
+        auto blocker =
+            pool.submit(
+                [&started]()
+                {
+                    started.set_value();
+
+                    sleep_ms(60);
+                }
+            );
+
+        started_future.wait();
+
+
+        std::promise<void> p1;
+        std::promise<void> p2;
+
+        std::vector<std::future<void>> inputs;
+
+        inputs.push_back(p1.get_future());
+        inputs.push_back(p2.get_future());
+
+        auto any =
+            pool.when_any(std::move(inputs));
+
+        pool.stop(PoolStopMode::IMMEDIATE);
+
+
+        bool ok = false;
+
+        if(any.wait_for(
+            std::chrono::seconds(2)
+        ) == std::future_status::ready)
+        {
+            try
+            {
+                (void)any.get();
+            }
+            catch(const std::runtime_error&)
+            {
+                ok = true;
+            }
+            catch(...)
+            {
+            }
+        }
+
+        expect(
+            ok,
+            "v5.1.1 stop(IMMEDIATE) void when_any future completes"
+        );
+
+        /* wait() never throws, even if the blocker itself was discarded. */
+        blocker.wait();
+    }
+
+
+    /* The normal composition path is unchanged by the hardening. */
+    {
+        ThreadPool pool;
+
+        std::promise<int> fast;
+        std::promise<int> slow;
+
+        std::vector<std::future<int>> inputs;
+
+        inputs.push_back(fast.get_future());
+        inputs.push_back(slow.get_future());
+
+        auto any =
+            pool.when_any(std::move(inputs));
+
+        fast.set_value(17);
+
+
+        bool ok = false;
+
+        if(any.wait_for(
+            std::chrono::seconds(2)
+        ) == std::future_status::ready)
+        {
+            try
+            {
+                auto pair = any.get();
+
+                ok =
+                    pair.first == 0
+                        &&
+                    pair.second == 17;
+            }
+            catch(...)
+            {
+            }
+        }
+
+        expect(
+            ok,
+            "v5.1.1 normal when_any still reports the first result"
+        );
+
+        slow.set_value(0);
+
+        pool.wait();
+    }
+}
+
+
 int main()
 {
     test_basics();
@@ -3503,6 +3747,8 @@ int main()
     test_v501_discard_and_context();
 
     test_v510_deadlines();
+
+    test_v511_composition_hardening();
 
 
     std::printf(

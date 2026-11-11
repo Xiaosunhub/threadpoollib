@@ -56,12 +56,17 @@
  * (submit_with_timeout / submit_with_deadline and priority variants),
  * TaskGroup::cancel_after / cancel_at, and the PoolMetrics.timed_out
  * counter.
+ *
+ * 5.1.1 hardens future composition: discarded or rejected when_any
+ * waiters still release their ticket, so the returned future never
+ * hangs; when_all() short-circuits empty input without occupying a
+ * worker.
  */
 #define THREADPOOL_VERSION_MAJOR 5
 #define THREADPOOL_VERSION_MINOR 1
-#define THREADPOOL_VERSION_PATCH 0
+#define THREADPOOL_VERSION_PATCH 1
 
-#define THREADPOOL_VERSION_STRING "5.1.0"
+#define THREADPOOL_VERSION_STRING "5.1.1"
 
 
 enum class PoolStopMode
@@ -1443,13 +1448,34 @@ public:
      * results as a vector in the same order.
      *
      * The aggregation itself runs as a task on this pool, so it does not
-     * block the calling thread.
+     * block the calling thread. That task does, however, occupy one worker
+     * while it waits: if the input futures also belong to this pool, make
+     * sure the pool has a spare worker for them (or use external promises),
+     * otherwise the aggregation can deadlock with its own inputs.
+     *
+     * An empty input is fulfilled synchronously without occupying a worker.
      */
     template <class T>
     std::future<std::vector<T>> when_all(
         std::vector<std::future<T>> futures
     )
     {
+        /*
+         * Short-circuit the empty case. Besides avoiding a useless task,
+         * this matters on a one-worker pool: a task that is only going to
+         * return an empty vector must not sit behind work the caller is
+         * already waiting for.
+         */
+        if(futures.empty())
+        {
+            std::promise<std::vector<T>> p;
+
+            p.set_value(std::vector<T>{});
+
+            return p.get_future();
+        }
+
+
         /*
          * The input is held by shared_ptr rather than moved straight into
          * the lambda: std::packaged_task requires its callable to be
@@ -1485,6 +1511,16 @@ public:
         std::vector<std::future<void>> futures
     )
     {
+        if(futures.empty())
+        {
+            std::promise<void> p;
+
+            p.set_value();
+
+            return p.get_future();
+        }
+
+
         auto futs =
             std::make_shared<
                 std::vector<std::future<void>>
@@ -1507,6 +1543,15 @@ public:
      * Only the first finisher is reported; exceptions from the others are
      * swallowed (they are still safe to ignore because each is observed by
      * its own internally spawned task).
+     *
+     * Each waiter occupies one worker while it blocks. If the input
+     * futures also belong to this pool, keep a spare worker for them or
+     * the aggregation can deadlock with its own inputs.
+     *
+     * Since 5.1.1 a waiter that is discarded (clear(), stop(IMMEDIATE))
+     * or rejected still spends its ticket. If every waiter disappears the
+     * returned future completes with a std::runtime_error instead of
+     * blocking forever.
      */
     template <class T>
     std::future<std::pair<std::size_t, T>> when_any(
@@ -1551,10 +1596,67 @@ public:
         }
 
 
+        /*
+         * One ticket per waiter. A waiter spends its ticket either at the
+         * end of the wrapper or through on_abandon when run_task() finds
+         * the task already CANCELLED. Rejected submissions never enter
+         * run_task() at all, so they spend theirs explicitly below.
+         *
+         * When the last ticket is spent without anybody claiming the
+         * result, no input future can ever be observed: fulfil the promise
+         * with an error rather than stranding the caller in get().
+         */
+        auto tickets =
+            std::make_shared<std::atomic<std::size_t>>(n);
+
+        auto finish =
+            [result_p, claimed, tickets]()
+            {
+                if(tickets->fetch_sub(
+                    1,
+                    std::memory_order_acq_rel
+                ) == 1)
+                {
+                    bool expected = false;
+
+                    if(claimed->compare_exchange_strong(
+                        expected,
+                        true
+                    ))
+                    {
+                        try
+                        {
+                            result_p->set_exception(
+                                std::make_exception_ptr(
+                                    std::runtime_error(
+                                        "ThreadPool::when_any: "
+                                        "all waiters were discarded"
+                                    )
+                                )
+                            );
+                        }
+                        catch(...)
+                        {
+                        }
+                    }
+                }
+            };
+
+
         for(std::size_t i = 0; i < n; ++i)
         {
-            submit(
-                [shared, result_p, claimed, i]() mutable
+            SubmitResult status =
+                SubmitResult::ACCEPTED;
+
+
+            (void)do_submit_token_ex(
+                0,
+                CancellationToken{},
+                true,
+                std::function<void()>(finish),
+                true,
+                status,
+                [shared, result_p, claimed, finish, i]() mutable
                 {
                     try
                     {
@@ -1567,9 +1669,24 @@ public:
                             true
                         ))
                         {
-                            result_p->set_value(
-                                {i, std::move(v)}
-                            );
+                            try
+                            {
+                                result_p->set_value(
+                                    {i, std::move(v)}
+                                );
+                            }
+                            catch(...)
+                            {
+                                try
+                                {
+                                    result_p->set_exception(
+                                        std::current_exception()
+                                    );
+                                }
+                                catch(...)
+                                {
+                                }
+                            }
                         }
                     }
                     catch(...)
@@ -1581,13 +1698,29 @@ public:
                             true
                         ))
                         {
-                            result_p->set_exception(
-                                std::current_exception()
-                            );
+                            try
+                            {
+                                result_p->set_exception(
+                                    std::current_exception()
+                                );
+                            }
+                            catch(...)
+                            {
+                            }
                         }
                     }
+
+                    finish();
                 }
             );
+
+
+            if(status != SubmitResult::ACCEPTED
+                &&
+                status != SubmitResult::CALLER_RUNS)
+            {
+                finish();
+            }
         }
 
 
@@ -1597,7 +1730,8 @@ public:
 
     /**
      * void specialization of when_any(): waits for the first future to
-     * finish, then returns its index.
+     * finish, then returns its index. Same discard safety as the value
+     * overload (5.1.1).
      */
     std::future<std::size_t> when_any(
         std::vector<std::future<void>> futures
@@ -1639,10 +1773,57 @@ public:
         }
 
 
+        auto tickets =
+            std::make_shared<std::atomic<std::size_t>>(n);
+
+        auto finish =
+            [result_p, claimed, tickets]()
+            {
+                if(tickets->fetch_sub(
+                    1,
+                    std::memory_order_acq_rel
+                ) == 1)
+                {
+                    bool expected = false;
+
+                    if(claimed->compare_exchange_strong(
+                        expected,
+                        true
+                    ))
+                    {
+                        try
+                        {
+                            result_p->set_exception(
+                                std::make_exception_ptr(
+                                    std::runtime_error(
+                                        "ThreadPool::when_any: "
+                                        "all waiters were discarded"
+                                    )
+                                )
+                            );
+                        }
+                        catch(...)
+                        {
+                        }
+                    }
+                }
+            };
+
+
         for(std::size_t i = 0; i < n; ++i)
         {
-            submit(
-                [shared, result_p, claimed, i]() mutable
+            SubmitResult status =
+                SubmitResult::ACCEPTED;
+
+
+            (void)do_submit_token_ex(
+                0,
+                CancellationToken{},
+                true,
+                std::function<void()>(finish),
+                true,
+                status,
+                [shared, result_p, claimed, finish, i]() mutable
                 {
                     try
                     {
@@ -1655,7 +1836,22 @@ public:
                             true
                         ))
                         {
-                            result_p->set_value(i);
+                            try
+                            {
+                                result_p->set_value(i);
+                            }
+                            catch(...)
+                            {
+                                try
+                                {
+                                    result_p->set_exception(
+                                        std::current_exception()
+                                    );
+                                }
+                                catch(...)
+                                {
+                                }
+                            }
                         }
                     }
                     catch(...)
@@ -1667,13 +1863,29 @@ public:
                             true
                         ))
                         {
-                            result_p->set_exception(
-                                std::current_exception()
-                            );
+                            try
+                            {
+                                result_p->set_exception(
+                                    std::current_exception()
+                                );
+                            }
+                            catch(...)
+                            {
+                            }
                         }
                     }
+
+                    finish();
                 }
             );
+
+
+            if(status != SubmitResult::ACCEPTED
+                &&
+                status != SubmitResult::CALLER_RUNS)
+            {
+                finish();
+            }
         }
 
 
