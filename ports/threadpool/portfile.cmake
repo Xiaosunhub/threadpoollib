@@ -6,7 +6,7 @@ vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO Xiaosunhub/threadpoollib
     REF v5.1.1
-    SHA512  0b32662b713aa18e2afaaf8e19d7340c4275c5ffdfdc12aced4bb3e2e4c8afdd812454bb260dea2a75dbd84fa58d1c3d4182e8edac44ca0e67197f8c530251ab
+    SHA512  2c09204ebcf50073cdc207fe04eed81aa95fd64e0f5b3edc1857e914b2cab3899dce3ca00f513badd15396f96e133c12d5dae497e080d87dc139b5cb057de035
     HEAD_REF main
 )
 
