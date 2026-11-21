@@ -3706,6 +3706,504 @@ void test_v511_composition_hardening()
 }
 
 
+void test_v520_periodic_tasks()
+{
+    std::printf("\n-- v5.2.0 periodic tasks --\n");
+
+    using Clock =
+        std::chrono::steady_clock;
+
+
+    /*
+     * Fixed rate: executions follow the arithmetic sequence anchored at
+     * the intended start of period 0, so a fast callable fires roughly
+     * every period even though nothing ever blocks it.
+     */
+    {
+        ThreadPool pool;
+
+        std::atomic<int> runs{0};
+
+        auto handle =
+            pool.schedule_at_fixed_rate(
+                std::chrono::milliseconds(0),
+                std::chrono::milliseconds(60),
+                [&runs]()
+                {
+                    runs.fetch_add(1);
+                }
+            );
+
+        sleep_ms(260);
+
+        const int seen = runs.load();
+
+        expect(
+            seen >= 4,
+            "v5.2.0 fixed_rate keeps the period pace"
+        );
+
+        expect(
+            seen < 20,
+            "v5.2.0 fixed_rate does not bunch into a tight loop"
+        );
+
+        handle.cancel();
+
+        sleep_ms(140);
+
+        expect(
+            runs.load() <= seen + 2,
+            "v5.2.0 fixed_rate stops shortly after cancel()"
+        );
+    }
+
+
+    /*
+     * Fixed delay: the interval is measured from the END of the previous
+     * run, so consecutive starts are at least exec + delay apart.
+     */
+    {
+        ThreadPool pool;
+
+        std::mutex mtx;
+
+        std::vector<Clock::time_point> starts;
+
+        auto handle =
+            pool.schedule_with_fixed_delay(
+                std::chrono::milliseconds(0),
+                std::chrono::milliseconds(50),
+                [&mtx, &starts]()
+                {
+                    sleep_ms(30);
+
+                    std::lock_guard<std::mutex> lock(mtx);
+
+                    starts.push_back(Clock::now());
+                }
+            );
+
+        sleep_ms(420);
+
+        handle.cancel();
+
+        sleep_ms(120);
+
+        std::size_t checked = 0;
+        bool spaced = true;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+
+            checked = starts.size();
+
+            for(std::size_t i = 1; i < starts.size(); ++i)
+            {
+                const auto gap =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        starts[i] - starts[i - 1]
+                    ).count();
+
+                if(gap < 70)
+                    spaced = false;
+            }
+        }
+
+        expect(
+            checked >= 3,
+            "v5.2.0 fixed_delay ran several periods"
+        );
+
+        expect(
+            checked < 10,
+            "v5.2.0 fixed_delay respects exec + delay spacing"
+        );
+
+        expect(
+            spaced,
+            "v5.2.0 fixed_delay gap >= exec + delay (minus slop)"
+        );
+    }
+
+
+    /*
+     * cancel() ends the chain once the current period returns; runs()
+     * freezes and last_error() stays empty.
+     */
+    {
+        ThreadPool pool;
+
+        std::atomic<int> runs{0};
+
+        auto handle =
+            pool.schedule_at_fixed_rate(
+                std::chrono::milliseconds(0),
+                std::chrono::milliseconds(40),
+                [&runs]()
+                {
+                    runs.fetch_add(1);
+                }
+            );
+
+        while(handle.runs() < 2)
+            sleep_ms(5);
+
+        handle.cancel();
+
+        sleep_ms(80);
+
+        const int frozen = runs.load();
+
+        sleep_ms(150);
+
+        expect(
+            runs.load() == frozen,
+            "v5.2.0 cancel() freezes the run count"
+        );
+
+        expect(
+            handle.is_cancelled(),
+            "v5.2.0 cancel() flips is_cancelled()"
+        );
+
+        expect(
+            handle.last_error() == nullptr,
+            "v5.2.0 cancel() carries no last_error"
+        );
+    }
+
+
+    /*
+     * An exception from the callable ends the chain and is observable
+     * through last_error(); the pool itself stays healthy.
+     */
+    {
+        ThreadPool pool;
+
+        auto handle =
+            pool.schedule_at_fixed_rate(
+                std::chrono::milliseconds(0),
+                std::chrono::milliseconds(40),
+                []()
+                {
+                    throw std::logic_error(
+                        "periodic boom"
+                    );
+                }
+            );
+
+        sleep_ms(120);
+
+        expect(
+            handle.runs() == 0,
+            "v5.2.0 throwing period is not counted as a run"
+        );
+
+        const std::exception_ptr err = handle.last_error();
+
+        expect(
+            err != nullptr,
+            "v5.2.0 exception stores last_error"
+        );
+
+        bool right_type = false;
+
+        if(err)
+        {
+            try
+            {
+                std::rethrow_exception(err);
+            }
+            catch(const std::logic_error&)
+            {
+                right_type = true;
+            }
+            catch(...)
+            {
+            }
+        }
+
+        expect(
+            right_type,
+            "v5.2.0 last_error preserves the exception type"
+        );
+
+        sleep_ms(120);
+
+        expect(
+            handle.runs() == 0,
+            "v5.2.0 exception ends the chain for good"
+        );
+
+        auto after =
+            pool.submit(
+                []()
+                {
+                    return 42;
+                }
+            );
+
+        expect(
+            after.get() == 42,
+            "v5.2.0 pool stays healthy after periodic failure"
+        );
+    }
+
+
+    /*
+     * The callable sees the chain's token through current_token(): a
+     * period that is RUNNING when cancel() lands observes the
+     * cancellation. (A period still queued is skipped outright - its
+     * wrapper throws before the callable is entered.)
+     */
+    {
+        ThreadPool pool;
+
+        std::atomic<int> observed{0};
+
+        auto handle =
+            pool.schedule_at_fixed_rate(
+                std::chrono::milliseconds(0),
+                std::chrono::milliseconds(50),
+                [&observed]()
+                {
+                    /*
+                     * Stay busy long enough for the main thread to
+                     * cancel while THIS period is running.
+                     */
+                    sleep_ms(60);
+
+                    if(ThreadPool::current_token().is_cancelled())
+                        observed.fetch_add(1);
+                }
+            );
+
+        sleep_ms(30);
+
+        handle.cancel();
+
+        sleep_ms(150);
+
+        expect(
+            observed.load() >= 1,
+            "v5.2.0 running period observes chain token via current_token()"
+        );
+
+        expect(
+            handle.last_error() == nullptr,
+            "v5.2.0 observing the token raises no last_error"
+        );
+    }
+
+
+    /*
+     * The bound arguments are shared across periods: the same callable
+     * object serves the whole chain, and arguments passed as lvalues
+     * must survive every run without being moved out.
+     */
+    {
+        ThreadPool pool;
+
+        std::mutex mtx;
+
+        std::vector<std::string> seen;
+
+        std::string tag = "fixed";
+
+        auto handle =
+            pool.schedule_with_fixed_delay(
+                std::chrono::milliseconds(0),
+                std::chrono::milliseconds(30),
+                [&mtx, &seen](
+                    const std::string& t,
+                    int n
+                )
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+
+                    seen.push_back(
+                        t + ":" + std::to_string(n)
+                    );
+                },
+                tag,
+                7
+            );
+
+        sleep_ms(160);
+
+        handle.cancel();
+
+        sleep_ms(80);
+
+        std::size_t count = 0;
+        bool intact = true;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+
+            count = seen.size();
+
+            for(const auto& s : seen)
+            {
+                if(s != "fixed:7")
+                    intact = false;
+            }
+        }
+
+        expect(
+            count >= 3,
+            "v5.2.0 bound-argument callable ran several periods"
+        );
+
+        expect(
+            intact,
+            "v5.2.0 bound arguments are reused, not consumed"
+        );
+
+        expect(
+            tag == "fixed",
+            "v5.2.0 caller's argument copy is untouched"
+        );
+    }
+
+
+    /*
+     * A pool destroyed with a live chain must not hang or crash: the
+     * queued periods are discarded, and no future is ever held by the
+     * chain itself.
+     */
+    {
+        bool fired = false;
+
+        {
+            ThreadPool pool;
+
+            (void)pool.schedule_at_fixed_rate(
+                std::chrono::milliseconds(0),
+                std::chrono::milliseconds(20),
+                [&fired]()
+                {
+                    fired = true;
+                }
+            );
+
+            sleep_ms(60);
+
+            expect(
+                fired,
+                "v5.2.0 periodic chain runs before destruction"
+            );
+        }
+
+        expect(
+            true,
+            "v5.2.0 pool destructor with a live chain returns"
+        );
+    }
+
+
+    /*
+     * A stopped pool rejects the first submission with the same
+     * contract as submit_at(): std::runtime_error.
+     */
+    {
+        ThreadPool pool;
+
+        pool.stop(PoolStopMode::GRACEFUL);
+
+        bool threw = false;
+
+        try
+        {
+            (void)pool.schedule_at_fixed_rate(
+                std::chrono::milliseconds(10),
+                std::chrono::milliseconds(10),
+                []()
+                {
+                }
+            );
+        }
+        catch(const std::runtime_error&)
+        {
+            threw = true;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            threw,
+            "v5.2.0 stopped pool throws on periodic submit"
+        );
+    }
+
+
+    /*
+     * A default-constructed handle controls nothing.
+     */
+    {
+        PeriodicTaskHandle handle;
+
+        expect(
+            !handle.valid(),
+            "v5.2.0 default handle is not valid"
+        );
+
+        expect(
+            handle.runs() == 0,
+            "v5.2.0 default handle reports zero runs"
+        );
+
+        expect(
+            handle.last_error() == nullptr,
+            "v5.2.0 default handle has no last_error"
+        );
+
+        handle.cancel();
+
+        expect(
+            !handle.is_cancelled(),
+            "v5.2.0 default handle cancel() is a no-op"
+        );
+    }
+
+
+    /*
+     * A non-positive period is a programming error, caught before any
+     * period is queued.
+     */
+    {
+        ThreadPool pool;
+
+        bool threw = false;
+
+        try
+        {
+            (void)pool.schedule_at_fixed_rate(
+                std::chrono::milliseconds(0),
+                std::chrono::milliseconds(0),
+                []()
+                {
+                }
+            );
+        }
+        catch(const std::invalid_argument&)
+        {
+            threw = true;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            threw,
+            "v5.2.0 non-positive period throws invalid_argument"
+        );
+    }
+}
+
+
 int main()
 {
     test_basics();
@@ -3749,6 +4247,8 @@ int main()
     test_v510_deadlines();
 
     test_v511_composition_hardening();
+
+    test_v520_periodic_tasks();
 
 
     std::printf(

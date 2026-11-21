@@ -61,12 +61,24 @@
  * waiters still release their ticket, so the returned future never
  * hangs; when_all() short-circuits empty input without occupying a
  * worker.
+ *
+ * 5.2.0 adds periodic scheduling: schedule_at_fixed_rate() and
+ * schedule_with_fixed_delay() build a self-rescheduling chain of
+ * deferred submissions controlled by a PeriodicTaskHandle (cancel(),
+ * is_cancelled(), runs(), last_error()). Fixed-rate runs follow an
+ * arithmetic sequence anchored at the first scheduled start, so an
+ * overrunning callable catches up; fixed-delay waits for the previous
+ * execution to finish before counting the next interval. Any exception
+ * from the callable ends the chain and is observable through
+ * last_error(); cancel() ends the chain once the current period
+ * returns; the callable sees the chain's token through
+ * ThreadPool::current_token().
  */
 #define THREADPOOL_VERSION_MAJOR 5
-#define THREADPOOL_VERSION_MINOR 1
-#define THREADPOOL_VERSION_PATCH 1
+#define THREADPOOL_VERSION_MINOR 2
+#define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "5.1.1"
+#define THREADPOOL_VERSION_STRING "5.2.0"
 
 
 enum class PoolStopMode
@@ -534,6 +546,245 @@ private:
 };
 
 
+namespace threadpool_detail
+{
+
+/*
+ * Shared state of one periodic chain (5.2.0).
+ *
+ * A periodic task is not a single queued task but a chain of deferred
+ * submissions: every period, once its callable returns, submits the next
+ * one. PeriodicChain is the anchor every link captures, so the handle
+ * can steer the whole chain and the runners can find the next deadline.
+ *
+ * Ownership is a plain shared_ptr held by both the handle and every
+ * queued runner; there is no cycle, because the chain never holds a
+ * reference to any runner.
+ */
+struct PeriodicChain
+{
+    /*
+     * Guards error only; everything else is atomic or written once
+     * before the first period is submitted.
+     */
+    std::mutex mtx;
+
+
+    /*
+     * The user exception that ended the chain, if the chain ended by
+     * an exception rather than by cancel() or pool shutdown.
+     */
+    std::exception_ptr error;
+
+
+    /*
+     * The writable side of the chain's cancellation domain. Every
+     * period's queued task carries source.token(), so request_cancel()
+     * skips any not-yet-started period and lets a running one observe
+     * the cancellation through ThreadPool::current_token().
+     */
+    CancellationSource source;
+
+
+    /*
+     * The user callable with its bound arguments, shared by every
+     * runner: one callable object serves the whole chain, so mutable
+     * state inside it persists across periods instead of being copied
+     * per run.
+     */
+    std::function<void()> user;
+
+
+    /*
+     * Completed executions so far.
+     */
+    std::atomic<std::uint64_t> runs{0};
+
+
+    /*
+     * Set once the chain will not schedule another period. Written by
+     * the runner on cancellation or failure; read before scheduling.
+     */
+    std::atomic<bool> dead{false};
+
+
+    /*
+     * Deadline of period 0. For fixed-rate chains every later period is
+     * first + n * period, which keeps the schedule anchored to the
+     * originally intended start times; written once below and only read
+     * afterwards, so it needs no synchronization.
+     */
+    std::chrono::steady_clock::time_point first;
+};
+
+
+/*
+ * Binds a user callable and its arguments into a zero-argument,
+ * result-discarding std::function for use inside a periodic chain.
+ *
+ * Arguments are held by value and passed as lvalues on EVERY
+ * invocation: the same function object serves the whole chain, so
+ * std::apply must not move out of the bound state on the first run.
+ *
+ * The result is discarded because a periodic chain has no per-run
+ * consumer for it; the runs() counter and last_error() are the
+ * observable outcome.
+ */
+template <class F, class... Args>
+std::function<void()> make_periodic_callable(
+    F&& f,
+    Args&&... args
+)
+{
+    using Callable =
+        std::decay_t<F>;
+
+    using ArgsTuple =
+        std::tuple<std::decay_t<Args>...>;
+
+
+    return [
+        callable = Callable(
+            std::forward<F>(f)
+        ),
+        bound = ArgsTuple(
+            std::forward<Args>(args)...
+        )
+    ]() mutable
+    {
+        if constexpr(
+            std::is_void_v<
+                std::invoke_result_t<
+                    Callable&,
+                    std::decay_t<Args>...
+                >
+            >
+        )
+        {
+            std::apply(
+                callable,
+                bound
+            );
+        }
+        else
+        {
+            (void)std::apply(
+                callable,
+                bound
+            );
+        }
+    };
+}
+
+
+}
+
+/**
+ * Control handle for a periodic task (5.2.0).
+ *
+ * A periodic task keeps submitting itself until it is stopped, so the
+ * classic future/handle pair does not fit: there is one future per
+ * period, endlessly. PeriodicTaskHandle is the single control surface
+ * for the whole chain instead.
+ */
+class PeriodicTaskHandle
+{
+public:
+    PeriodicTaskHandle() = default;
+
+
+    /*
+     * Stop the chain after the current period returns.
+     *
+     * A period that is still queued is skipped outright (its token is
+     * already cancelled when the worker picks it up); a period that is
+     * running runs to completion, cooperatively - the callable may
+     * observe ThreadPool::current_token() and bail out early, but it is
+     * never terminated forcibly.
+     *
+     * Idempotent and thread-safe.
+     */
+    void cancel()
+    {
+        if(state_)
+            state_->source.request_cancel();
+    }
+
+
+    bool is_cancelled() const
+    {
+        return state_
+            && state_->source.is_cancelled();
+    }
+
+
+    /*
+     * How many periods completed successfully so far. Note that a
+     * running period is not counted until its callable returns.
+     */
+    std::uint64_t runs() const
+    {
+        return state_
+            ? state_->runs.load(std::memory_order_relaxed)
+            : 0;
+    }
+
+
+    /*
+     * The exception that ended the chain, if any.
+     *
+     * A chain ended by cancel() or by pool shutdown carries no error;
+     * a chain ended by a throwing callable stores that exception here.
+     * The exception is still delivered to nothing else - a periodic
+     * chain has no single future to carry it - so callers that care
+     * about per-period failures should catch inside the callable.
+     */
+    std::exception_ptr last_error() const
+    {
+        if(!state_)
+            return nullptr;
+
+
+        std::lock_guard<std::mutex> lock(state_->mtx);
+
+
+        return state_->error;
+    }
+
+
+    bool valid() const
+    {
+        return static_cast<bool>(state_);
+    }
+
+
+    explicit operator bool() const
+    {
+        return valid();
+    }
+
+
+private:
+    explicit PeriodicTaskHandle(
+        std::shared_ptr<threadpool_detail::PeriodicChain> state
+    )
+        : state_(std::move(state))
+    {
+    }
+
+
+private:
+    /*
+     * A default-constructed handle controls nothing: cancel() and
+     * is_cancelled() are no-ops, runs() is 0.
+     */
+    std::shared_ptr<threadpool_detail::PeriodicChain> state_;
+
+
+    friend class ThreadPool;
+};
+
+
 /**
  * Task cancellation control handle.
  *
@@ -969,6 +1220,82 @@ public:
                 std::invoke_result_t<F, Args...>
             >
         >;
+
+
+    // ============================================================
+    // Periodic tasks (5.2.0)
+    // ============================================================
+
+    /**
+     * Submit a task that repeats forever at a fixed rate.
+     *
+     * The first execution starts after initial_delay; execution n (n =
+     * 0, 1, 2, ...) is scheduled for first_start + n * period, where
+     * first_start is the originally intended start of the first run.
+     * This is Java ScheduledExecutorService semantics: if a callable
+     * overruns its period, the missed slots fire back to back until the
+     * schedule catches up - the pace is anchored to the clock, not to
+     * the end of the previous run.
+     *
+     * Returns a control handle (priority 0). The chain continues until
+     * handle.cancel() is called, the callable throws, or the pool
+     * stops; each of those ends the chain after the current period
+     * returns. The callable can observe the chain's cancellation token
+     * through ThreadPool::current_token() and bail out early.
+     *
+     * Throws std::invalid_argument if period is not positive, and
+     * std::runtime_error if the pool is already stopped.
+     *
+     * Note: between two periods nothing is in flight, so wait() may
+     * return while the chain is still alive.
+     */
+    template <
+        class Rep1, class Period1,
+        class Rep2, class Period2,
+        class F, class... Args
+    >
+    PeriodicTaskHandle schedule_at_fixed_rate(
+        const std::chrono::duration<
+            Rep1,
+            Period1
+        >& initial_delay,
+        const std::chrono::duration<
+            Rep2,
+            Period2
+        >& period,
+        F&& f,
+        Args&&... args
+    );
+
+
+    /**
+     * Submit a task that repeats forever with a fixed delay.
+     *
+     * The first execution starts after initial_delay; every later
+     * execution starts delay after the *end* of the previous one. This
+     * is the other Java ScheduledExecutorService flavor: an overrunning
+     * callable simply pushes the schedule back instead of bunching up.
+     *
+     * Cancellation, exceptions and metrics follow
+     * schedule_at_fixed_rate(); see there for details.
+     */
+    template <
+        class Rep1, class Period1,
+        class Rep2, class Period2,
+        class F, class... Args
+    >
+    PeriodicTaskHandle schedule_with_fixed_delay(
+        const std::chrono::duration<
+            Rep1,
+            Period1
+        >& initial_delay,
+        const std::chrono::duration<
+            Rep2,
+            Period2
+        >& delay,
+        F&& f,
+        Args&&... args
+    );
 
 
     // ============================================================
@@ -2274,6 +2601,50 @@ private:
         -> TaskResult<
             std::invoke_result_t<F, Args...>
         >;
+
+
+    /*
+     * Engine of the 5.2.0 periodic API. Builds the PeriodicChain, binds
+     * the user callable once, and submits the first period due at
+     * now + initial_delay. Every later period is scheduled by the
+     * runner itself through schedule_periodic_at().
+     */
+    template <
+        class Rep1, class Period1,
+        class Rep2, class Period2,
+        class F, class... Args
+    >
+    PeriodicTaskHandle do_schedule_periodic(
+        bool fixed_rate,
+        const std::chrono::duration<
+            Rep1,
+            Period1
+        >& initial_delay,
+        const std::chrono::duration<
+            Rep2,
+            Period2
+        >& period,
+        F&& f,
+        Args&&... args
+    );
+
+
+    /*
+     * Submits one period of the chain anchored by chain, due at 'at',
+     * as period number 'index'. Not a template: the per-period callable
+     * is already type-erased, so the definition lives in the cpp.
+     *
+     * Returns the submission status; the chain runner treats anything
+     * other than ACCEPTED as the end of the chain (which for a stopping
+     * pool is exactly the desired outcome).
+     */
+    SubmitResult schedule_periodic_at(
+        const std::shared_ptr<threadpool_detail::PeriodicChain>& chain,
+        bool fixed_rate,
+        std::chrono::steady_clock::duration period,
+        std::size_t index,
+        std::chrono::steady_clock::time_point at
+    );
 
 
     bool pop_task_locked(Task& out);
@@ -3603,6 +3974,166 @@ auto ThreadPool::do_schedule_after(
         allow_wait,
         status,
         at,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+// ============================================================
+// do_schedule_periodic (5.2.0)
+// ============================================================
+
+template <
+    class Rep1, class Period1,
+    class Rep2, class Period2,
+    class F, class... Args
+>
+PeriodicTaskHandle ThreadPool::do_schedule_periodic(
+    bool fixed_rate,
+    const std::chrono::duration<
+        Rep1,
+        Period1
+    >& initial_delay,
+    const std::chrono::duration<
+        Rep2,
+        Period2
+    >& period,
+    F&& f,
+    Args&&... args
+)
+{
+    using Callable =
+        std::decay_t<F>;
+
+
+    static_assert(
+        std::is_invocable_v<
+            Callable&,
+            std::decay_t<Args>...
+        >,
+        "ThreadPool: callable is not invocable with the given arguments"
+    );
+
+
+    const std::chrono::steady_clock::duration period_ticks =
+        std::chrono::duration_cast<
+            std::chrono::steady_clock::duration
+        >(period);
+
+
+    if(period_ticks.count() <= 0)
+    {
+        throw std::invalid_argument(
+            "ThreadPool: periodic period must be positive"
+        );
+    }
+
+
+    auto chain =
+        std::make_shared<threadpool_detail::PeriodicChain>();
+
+
+    /*
+     * Fixed-rate anchors the whole arithmetic sequence at the intended
+     * start of period 0; fixed-delay ignores the anchor and measures
+     * from the end of the previous run instead.
+     */
+    chain->first =
+        std::chrono::steady_clock::now()
+        + initial_delay;
+
+
+    chain->user =
+        threadpool_detail::make_periodic_callable(
+            std::forward<F>(f),
+            std::forward<Args>(args)...
+        );
+
+
+    const SubmitResult status =
+        schedule_periodic_at(
+            chain,
+            fixed_rate,
+            period_ticks,
+            0,
+            chain->first
+        );
+
+
+    /*
+     * The first submission is the only one this call makes directly, so
+     * it mirrors submit_at()'s rejection contract: a pool that is
+     * already stopped raises instead of returning a silently dead
+     * handle. Later periods are submitted by the runner itself, which
+     * treats rejection as the end of the chain.
+     */
+    if(status == SubmitResult::REJECTED_STOPPED)
+    {
+        throw std::runtime_error(
+            "ThreadPool already stopped"
+        );
+    }
+
+
+    return PeriodicTaskHandle(std::move(chain));
+}
+
+
+// ============================================================
+// schedule_at_fixed_rate / schedule_with_fixed_delay
+// ============================================================
+
+template <
+    class Rep1, class Period1,
+    class Rep2, class Period2,
+    class F, class... Args
+>
+PeriodicTaskHandle ThreadPool::schedule_at_fixed_rate(
+    const std::chrono::duration<
+        Rep1,
+        Period1
+    >& initial_delay,
+    const std::chrono::duration<
+        Rep2,
+        Period2
+    >& period,
+    F&& f,
+    Args&&... args
+)
+{
+    return do_schedule_periodic(
+        true,
+        initial_delay,
+        period,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <
+    class Rep1, class Period1,
+    class Rep2, class Period2,
+    class F, class... Args
+>
+PeriodicTaskHandle ThreadPool::schedule_with_fixed_delay(
+    const std::chrono::duration<
+        Rep1,
+        Period1
+    >& initial_delay,
+    const std::chrono::duration<
+        Rep2,
+        Period2
+    >& delay,
+    F&& f,
+    Args&&... args
+)
+{
+    return do_schedule_periodic(
+        false,
+        initial_delay,
+        delay,
         std::forward<F>(f),
         std::forward<Args>(args)...
     );

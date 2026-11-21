@@ -2203,3 +2203,161 @@ std::size_t ThreadPool::active_count() const
             std::memory_order_relaxed
         );
 }
+
+
+// ============================================================
+// schedule_periodic_at (5.2.0)
+// ============================================================
+
+ThreadPool::SubmitResult ThreadPool::schedule_periodic_at(
+    const std::shared_ptr<threadpool_detail::PeriodicChain>& chain,
+    bool fixed_rate,
+    std::chrono::steady_clock::duration period,
+    std::size_t index,
+    std::chrono::steady_clock::time_point at
+)
+{
+    /*
+     * The runner for period 'index'. It runs the user callable exactly
+     * once, and only if the period actually started - a token cancelled
+     * while the period was still queued makes do_schedule_at_token's
+     * body throw before the runner is entered, which quietly ends the
+     * chain (nothing ever schedules the next period).
+     *
+     * Scheduling the next period from inside the runner keeps the pool
+     * free between periods: a chain is a sequence of deferred one-shot
+     * tasks, never a task that sleeps.
+     *
+     * The lambda captures 'chain' (shared_ptr), so the chain - and the
+     * shared user callable - stays alive as long as any period is
+     * queued or running. There is no cycle: the chain never holds a
+     * runner.
+     */
+    auto runner =
+        [this, chain, fixed_rate, period, index]()
+        {
+            try
+            {
+                if(chain->user)
+                    chain->user();
+            }
+            catch(...)
+            {
+                /*
+                 * Any exception ends the chain (Java semantics). Two
+                 * sources must be told apart: the callable itself
+                 * throwing is a user error and is recorded in
+                 * last_error(), while a cancellation observed through
+                 * the chain's token (the callable called
+                 * throw_if_cancelled() after handle.cancel()) is a
+                 * requested outcome and is not.
+                 */
+                if(chain->source.token().is_cancelled())
+                {
+                    /* Cancellation: leave last_error() empty. */
+                }
+                else
+                {
+                    std::lock_guard<std::mutex> lock(chain->mtx);
+
+                    chain->error =
+                        std::current_exception();
+                }
+
+                chain->dead.store(
+                    true,
+                    std::memory_order_release
+                );
+
+                throw;
+            }
+
+
+            chain->runs.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+
+            if(chain->dead.load(std::memory_order_acquire))
+                return;
+
+
+            /*
+             * cancel() while this period was running: the callable
+             * completed, so it is counted, but the chain stops here.
+             */
+            if(chain->source.is_cancelled())
+            {
+                chain->dead.store(
+                    true,
+                    std::memory_order_release
+                );
+
+                return;
+            }
+
+
+            std::chrono::steady_clock::time_point next;
+
+
+            if(fixed_rate)
+            {
+                /*
+                 * Catch-up semantics: period n is anchored at
+                 * first + n * period, so a run that overran its slot
+                 * fires the missed slots back to back instead of
+                 * drifting.
+                 */
+                next =
+                    chain->first
+                    + period
+                        * static_cast<std::chrono::steady_clock::rep>(
+                            index + 1
+                        );
+            }
+            else
+            {
+                /*
+                 * Fixed delay: the interval starts when the previous
+                 * execution ENDS, so an overrunning callable pushes the
+                 * schedule back instead of bunching up.
+                 */
+                next =
+                    std::chrono::steady_clock::now()
+                    + period;
+            }
+
+
+            /*
+             * The submission status decides nothing here: a stopped pool
+             * rejects the next period, which is exactly the end of the
+             * chain. The status is only surfaced to the public entry
+             * point for its "already stopped" exception.
+             */
+            schedule_periodic_at(
+                chain,
+                fixed_rate,
+                period,
+                index + 1,
+                next
+            );
+        };
+
+
+    SubmitResult status =
+        SubmitResult::ACCEPTED;
+
+
+    (void)do_schedule_at_token(
+        0,
+        chain->source.token(),
+        false,
+        status,
+        at,
+        std::move(runner)
+    );
+
+
+    return status;
+}
