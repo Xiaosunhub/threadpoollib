@@ -3962,26 +3962,48 @@ void test_v520_periodic_tasks()
 
         std::atomic<int> observed{0};
 
+        /*
+         * Two-way handshake instead of a fixed sleep:
+         *   callable sets 'entered' once it is really running,
+         *   main thread waits for that before calling cancel(),
+         *   then sets 'go' so the callable checks the token.
+         *
+         * A plain sleep could fire while the first period was still
+         * queued - in that case it is skipped before the callable ever
+         * runs, and the token is never observed (this made the test
+         * flaky under load).
+         */
+        std::atomic<bool> entered{false};
+        std::atomic<bool> go{false};
+
         auto handle =
             pool.schedule_at_fixed_rate(
                 std::chrono::milliseconds(0),
                 std::chrono::milliseconds(50),
-                [&observed]()
+                [&observed, &entered, &go]()
                 {
-                    /*
-                     * Stay busy long enough for the main thread to
-                     * cancel while THIS period is running.
-                     */
-                    sleep_ms(60);
+                    entered.store(
+                        true,
+                        std::memory_order_release
+                    );
+
+                    while(!go.load(std::memory_order_acquire))
+                        sleep_ms(1);
 
                     if(ThreadPool::current_token().is_cancelled())
                         observed.fetch_add(1);
                 }
             );
 
-        sleep_ms(30);
+        while(!entered.load(std::memory_order_acquire))
+            sleep_ms(1);
 
         handle.cancel();
+
+        go.store(
+            true,
+            std::memory_order_release
+        );
 
         sleep_ms(150);
 
@@ -4204,6 +4226,352 @@ void test_v520_periodic_tasks()
 }
 
 
+void test_v530_config_and_generics()
+{
+    std::printf("\n-- v5.3.0 config macros and generics --\n");
+
+    using namespace std::chrono_literals;
+
+
+    /*
+     * Compile-time config: the macro defaults must match the documented
+     * values. A consumer that defines them before including the header
+     * gets different defaults - that path is exercised by the separate
+     * no-features build.
+     */
+    {
+        ThreadPool::Config cfg;
+
+        expect(
+            cfg.min_threads == THREADPOOL_CFG_MIN_THREADS
+                &&
+            cfg.max_threads == THREADPOOL_CFG_MAX_THREADS,
+            "v5.3.0 Config picks up THREADPOOL_CFG thread macros"
+        );
+
+        expect(
+            cfg.max_queue == THREADPOOL_CFG_MAX_QUEUE
+                &&
+            cfg.batch_size == THREADPOOL_CFG_BATCH_SIZE,
+            "v5.3.0 Config picks up queue and batch macros"
+        );
+
+        expect(
+            cfg.idle_timeout
+                == std::chrono::milliseconds(
+                    THREADPOOL_CFG_IDLE_TIMEOUT_MS
+                ),
+            "v5.3.0 Config picks up idle timeout macro"
+        );
+
+        expect(
+            cfg.reject
+                == static_cast<RejectPolicy>(
+                    THREADPOOL_CFG_REJECT_POLICY
+                ),
+            "v5.3.0 Config picks up reject policy macro"
+        );
+
+        expect(
+            std::string(THREADPOOL_VERSION_STRING) == "5.3.0"
+                &&
+            THREADPOOL_VERSION_MAJOR == 5
+                &&
+            THREADPOOL_VERSION_MINOR == 3
+                &&
+            THREADPOOL_VERSION_PATCH == 0,
+            "v5.3.0 version macros are consistent"
+        );
+    }
+
+
+    /*
+     * A type that can neither be copied nor moved: it owns a mutex and
+     * deliberately deletes both operations. std::future<Immobile> is
+     * impossible, but submit_discard and submit_shared must work.
+     */
+    struct Immobile
+    {
+        Immobile() = default;
+
+        Immobile(const Immobile&) = delete;
+        Immobile& operator=(const Immobile&) = delete;
+        Immobile(Immobile&&) = delete;
+        Immobile& operator=(Immobile&&) = delete;
+
+        int value = 0;
+    };
+
+
+    /*
+     * submit_discard with a callable returning a non-movable prvalue.
+     */
+    {
+        ThreadPool pool;
+
+        std::atomic<int> observed{0};
+
+        auto f =
+            pool.submit_discard(
+                [&observed]()
+                {
+                    Immobile local;
+
+                    local.value = 42;
+
+                    observed.store(
+                        local.value,
+                        std::memory_order_relaxed
+                    );
+
+                    /*
+                     * Returning a prvalue of a non-movable type is legal
+                     * here: the discarded wrapper never stores it.
+                     */
+                    return Immobile{};
+                }
+            );
+
+        f.get();
+
+        expect(
+            observed.load() == 42,
+            "v5.3.0 submit_discard accepts a non-movable return type"
+        );
+    }
+
+
+    /*
+     * submit_discard with void, with moved arguments, and exceptions.
+     */
+    {
+        ThreadPool pool;
+
+        std::atomic<int> sum{0};
+
+        auto ptr = std::make_unique<int>(7);
+
+        auto a =
+            pool.submit_discard(
+                [&sum](std::unique_ptr<int> p, int k)
+                {
+                    sum.fetch_add(*p + k);
+                },
+                std::move(ptr),
+                5
+            );
+
+        auto b =
+            pool.submit_discard_priority(
+                1,
+                []()
+                {
+                    throw std::runtime_error(
+                        "discard boom"
+                    );
+                }
+            );
+
+        a.get();
+
+        expect(
+            sum.load() == 12,
+            "v5.3.0 submit_discard forwards move-only arguments"
+        );
+
+        bool threw = false;
+
+        try
+        {
+            b.get();
+        }
+        catch(const std::runtime_error&)
+        {
+            threw = true;
+        }
+        catch(...)
+        {
+        }
+
+        expect(
+            threw,
+            "v5.3.0 submit_discard propagates callable exceptions"
+        );
+    }
+
+
+    /*
+     * submit_shared constructs a non-movable T in place.
+     */
+    {
+        ThreadPool pool;
+
+        auto f =
+            pool.submit_shared<Immobile>();
+
+        auto obj = f.get();
+
+        expect(
+            obj != nullptr && obj->value == 0,
+            "v5.3.0 submit_shared constructs a non-movable type"
+        );
+
+        /*
+         * The type has no move constructor at all; the fact that this
+         * compiled and ran is the assertion.
+         */
+        static_assert(
+            !std::is_move_constructible_v<Immobile>,
+            "test type must be non-movable"
+        );
+    }
+
+
+    /*
+     * submit_shared with move-only constructor arguments and a type
+     * carrying a mutex (another classic non-movable type).
+     */
+    {
+        ThreadPool pool;
+
+        struct LockedBox
+        {
+            explicit LockedBox(std::unique_ptr<int> p)
+                : value(std::move(p))
+            {
+            }
+
+            std::mutex mtx;
+            std::unique_ptr<int> value;
+        };
+
+        auto f =
+            pool.submit_shared_priority<LockedBox>(
+                2,
+                std::make_unique<int>(99)
+            );
+
+        auto box = f.get();
+
+        int seen = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(box->mtx);
+
+            seen = *box->value;
+        }
+
+        expect(
+            seen == 99,
+            "v5.3.0 submit_shared forwards move-only ctor args"
+        );
+    }
+
+
+    /*
+     * A callable returning a reference: std::future<T&> is a first-class
+     * future specialization and the ordinary submit() must preserve it.
+     */
+    {
+        ThreadPool pool;
+
+        int storage = 5;
+
+        auto f =
+            pool.submit(
+                [&storage]() -> int&
+                {
+                    return storage;
+                }
+            );
+
+        int& ref = f.get();
+
+        ref = 33;
+
+        expect(
+            storage == 33,
+            "v5.3.0 submit preserves reference return types"
+        );
+    }
+
+
+    /*
+     * Function pointers and move-only callable objects are accepted.
+     */
+    {
+        ThreadPool pool;
+
+        auto square = [](int x)
+        {
+            return x * x;
+        };
+
+        using FnPtr = int (*)(int);
+
+        FnPtr fp = +square;
+
+        auto f1 = pool.submit(fp, 6);
+
+        expect(
+            f1.get() == 36,
+            "v5.3.0 submit accepts function pointers"
+        );
+
+        auto movable = std::make_unique<int>(4);
+
+        auto f2 =
+            pool.submit(
+                [p = std::move(movable)]()
+                {
+                    return *p;
+                }
+            );
+
+        expect(
+            f2.get() == 4,
+            "v5.3.0 submit accepts move-only callables"
+        );
+    }
+
+
+    /*
+     * Metrics stay zero when compiled out. With metrics enabled the
+     * pool is busy enough that submitted > 0 must hold.
+     */
+    {
+        ThreadPool pool;
+
+        auto f = pool.submit([]()
+        {
+        });
+
+        f.get();
+
+        /*
+         * wait() is required here: the wrapper updates completed_ AFTER
+         * the future is fulfilled, so reading metrics immediately after
+         * get() can observe the increment still in flight.
+         */
+        pool.wait();
+
+        const PoolMetrics m = pool.get_metrics();
+
+#if THREADPOOL_CFG_ENABLE_METRICS
+        expect(
+            m.submitted >= 1 && m.completed >= 1,
+            "v5.3.0 metrics enabled counters are live"
+        );
+#else
+        expect(
+            m.submitted == 0 && m.completed == 0,
+            "v5.3.0 metrics disabled counters read zero"
+        );
+#endif
+    }
+}
+
+
 int main()
 {
     test_basics();
@@ -4249,6 +4617,8 @@ int main()
     test_v511_composition_hardening();
 
     test_v520_periodic_tasks();
+
+    test_v530_config_and_generics();
 
 
     std::printf(

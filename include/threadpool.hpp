@@ -24,6 +24,88 @@
 
 
 /*
+ * ============================================================
+ * Compile-time configuration (5.3.0)
+ * ============================================================
+ *
+ * Every option below is a plain macro with a default defined via
+ * #ifndef. Define any of them before including this header to
+ * customize the pool at compile time; no source change is needed.
+ *
+ * Two groups are provided:
+ *
+ *   THREADPOOL_CFG_* defaults  - initial values of ThreadPool::Config
+ *                                (callers can still override at runtime)
+ *   THREADPOOL_CFG_ENABLE_*    - feature switches; setting one to 0
+ *                                compiles that feature out entirely
+ *
+ * All switches default to 1, so the default build is behaviorally
+ * identical to 5.2.0. Turning one off removes its work from the hot
+ * path; see each switch's documentation for the exact trade-off.
+ *
+ * NOTE: these are process-wide compile-time settings. Every
+ * translation unit that includes this header must see the same
+ * values, otherwise the class layout (metric counters, Worker
+ * fields) would differ across TUs.
+ */
+
+/* ---- Config defaults ------------------------------------------------ */
+
+#ifndef THREADPOOL_CFG_MIN_THREADS
+#define THREADPOOL_CFG_MIN_THREADS 2
+#endif
+
+#ifndef THREADPOOL_CFG_MAX_THREADS
+#define THREADPOOL_CFG_MAX_THREADS 8
+#endif
+
+#ifndef THREADPOOL_CFG_MAX_QUEUE
+#define THREADPOOL_CFG_MAX_QUEUE 256
+#endif
+
+#ifndef THREADPOOL_CFG_IDLE_TIMEOUT_MS
+#define THREADPOOL_CFG_IDLE_TIMEOUT_MS 2000
+#endif
+
+#ifndef THREADPOOL_CFG_BATCH_SIZE
+#define THREADPOOL_CFG_BATCH_SIZE 1
+#endif
+
+/* RejectPolicy: 0 = BLOCK, 1 = DISCARD, 2 = CALLER_RUNS */
+#ifndef THREADPOOL_CFG_REJECT_POLICY
+#define THREADPOOL_CFG_REJECT_POLICY 0
+#endif
+
+
+/* ---- Feature switches ---------------------------------------------- */
+
+/*
+ * Collect PoolMetrics (submitted/completed/failed/stolen/...).
+ *
+ * Set to 0 to remove every metric increment from the hot path.
+ * get_metrics() still compiles and returns zero-filled data, so
+ * callers need no #ifdef. Saves one atomic RMW per task transition.
+ */
+#ifndef THREADPOOL_CFG_ENABLE_METRICS
+#define THREADPOOL_CFG_ENABLE_METRICS 1
+#endif
+
+/*
+ * Work stealing: an idle worker may take tasks from a peer's deque.
+ *
+ * Set to 0 for strict owner-only deques. Saves the snapshot/lock
+ * probe in the worker's idle path; useful for pipelines where tasks
+ * are never nested and each producer strictly owns its deque.
+ */
+#ifndef THREADPOOL_CFG_ENABLE_WORK_STEALING
+#define THREADPOOL_CFG_ENABLE_WORK_STEALING 1
+#endif
+
+
+/* ============================================================ */
+
+
+/*
  * Keep these in sync with project(VERSION ...) in CMakeLists.txt.
  *
  * Consumers need a compile-time way to detect the API level: batch_size,
@@ -73,12 +155,20 @@
  * last_error(); cancel() ends the chain once the current period
  * returns; the callable sees the chain's token through
  * ThreadPool::current_token().
+ *
+ * 5.3.0 adds compile-time configuration: THREADPOOL_CFG_* macros set
+ * Config defaults and switch optional machinery (metrics, work
+ * stealing) on/off at build time. It also widens the type contract:
+ * submit_discard() runs any callable and discards its result, so even
+ * non-movable return types are accepted; submit_shared() carries the
+ * result in a shared_ptr for the same reason. References, move-only
+ * arguments and function objects are explicitly supported throughout.
  */
 #define THREADPOOL_VERSION_MAJOR 5
-#define THREADPOOL_VERSION_MINOR 2
+#define THREADPOOL_VERSION_MINOR 3
 #define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "5.2.0"
+#define THREADPOOL_VERSION_STRING "5.3.0"
 
 
 enum class PoolStopMode
@@ -121,6 +211,127 @@ enum class TaskState
  */
 namespace threadpool_detail
 {
+    /*
+     * Compile-time selectable metric counter (5.3.0).
+     *
+     * With THREADPOOL_CFG_ENABLE_METRICS=1 this is a thin wrapper over
+     * std::atomic<T>; with 0 every operation is a no-op and load()
+     * always returns 0. Keeping the same interface means the ~30
+     * increment sites in the pool need no #ifdef noise, while the
+     * compiler still eliminates all counter work in the disabled
+     * build.
+     */
+    template <class T, bool Enabled = (THREADPOOL_CFG_ENABLE_METRICS != 0)>
+    struct metric_counter;
+
+
+    template <class T>
+    struct metric_counter<T, true>
+    {
+        metric_counter() = default;
+
+
+        explicit metric_counter(T initial)
+            : value(initial)
+        {
+        }
+
+
+        T fetch_add(
+            T delta,
+            std::memory_order order = std::memory_order_relaxed
+        )
+        {
+            return value.fetch_add(
+                delta,
+                order
+            );
+        }
+
+
+        T fetch_sub(
+            T delta,
+            std::memory_order order = std::memory_order_relaxed
+        )
+        {
+            return value.fetch_sub(
+                delta,
+                order
+            );
+        }
+
+
+        T load(
+            std::memory_order order = std::memory_order_relaxed
+        ) const
+        {
+            return value.load(order);
+        }
+
+
+        void store(
+            T desired,
+            std::memory_order order = std::memory_order_relaxed
+        )
+        {
+            value.store(
+                desired,
+                order
+            );
+        }
+
+
+    private:
+        std::atomic<T> value{0};
+    };
+
+
+    template <class T>
+    struct metric_counter<T, false>
+    {
+        metric_counter() = default;
+
+
+        explicit metric_counter(T)
+        {
+        }
+
+
+        T fetch_add(
+            T,
+            std::memory_order = std::memory_order_relaxed
+        )
+        {
+            return 0;
+        }
+
+
+        T fetch_sub(
+            T,
+            std::memory_order = std::memory_order_relaxed
+        )
+        {
+            return 0;
+        }
+
+
+        T load(
+            std::memory_order = std::memory_order_relaxed
+        ) const
+        {
+            return 0;
+        }
+
+
+        void store(
+            T,
+            std::memory_order = std::memory_order_relaxed
+        )
+        {
+        }
+    };
+
+
     template <class T>
     struct TaskBody
     {
@@ -948,12 +1159,19 @@ public:
 
     struct Config
     {
-        std::size_t min_threads = 2;
-        std::size_t max_threads = 8;
+        /*
+         * Defaults come from the THREADPOOL_CFG_* macros defined at the
+         * top of this header. They remain ordinary members, so any
+         * caller can still override them at runtime as before.
+         */
+        std::size_t min_threads = THREADPOOL_CFG_MIN_THREADS;
+        std::size_t max_threads = THREADPOOL_CFG_MAX_THREADS;
 
-        std::size_t max_queue = 256;
+        std::size_t max_queue = THREADPOOL_CFG_MAX_QUEUE;
 
-        std::chrono::milliseconds idle_timeout{2000};
+        std::chrono::milliseconds idle_timeout{
+            THREADPOOL_CFG_IDLE_TIMEOUT_MS
+        };
 
         /*
          * Number of tasks a worker takes out of the queue per critical
@@ -964,9 +1182,12 @@ public:
          *
          * Values below 1 are treated as 1.
          */
-        std::size_t batch_size = 1;
+        std::size_t batch_size = THREADPOOL_CFG_BATCH_SIZE;
 
-        RejectPolicy reject = RejectPolicy::BLOCK;
+        RejectPolicy reject =
+            static_cast<RejectPolicy>(
+                THREADPOOL_CFG_REJECT_POLICY
+            );
 
         /*
          * Optional hook executed once at the beginning of every worker
@@ -1220,6 +1441,72 @@ public:
                 std::invoke_result_t<F, Args...>
             >
         >;
+
+
+    // ============================================================
+    // Generic result adapters (5.3.0)
+    // ============================================================
+
+    /**
+     * Run a callable and discard its result (priority 0).
+     *
+     * The ordinary submit() stores the callable's result in a
+     * std::packaged_task<R()>, which requires R to be a type that
+     * std::future can carry. That excludes non-movable result types
+     * and can be wasteful when the result is not needed at all.
+     *
+     * submit_discard() invokes the callable inside a void-returning
+     * wrapper, so ANY return type is accepted: void, references,
+     * move-only values, non-movable structs, aggregates - the result
+     * is simply thrown away. Returned future becomes ready when the
+     * callable finishes; exceptions propagate through it as usual.
+     *
+     * Throws std::runtime_error if the pool is stopped.
+     */
+    template <class F, class... Args>
+    std::future<void> submit_discard(
+        F&& f,
+        Args&&... args
+    );
+
+
+    template <class F, class... Args>
+    std::future<void> submit_discard_priority(
+        int priority,
+        F&& f,
+        Args&&... args
+    );
+
+
+    /**
+     * Construct T in the worker thread and return a future to a
+     * shared_ptr<T> (priority 0).
+     *
+     * std::future<T> requires T to be movable out of the promise, so
+     * genuinely non-movable types (types with a std::mutex member,
+     * deleted move constructors, abstract bases via a concrete T,
+     * etc.) cannot be returned by submit(). This adapter sidesteps
+     * that entirely: T is constructed in place with the supplied
+     * arguments and only the shared_ptr crosses the thread boundary.
+     *
+     * The arguments are decayed and moved into the task, so move-only
+     * constructor arguments are supported. The returned shared_ptr
+     * keeps T alive as long as any caller holds it.
+     *
+     * Throws std::runtime_error if the pool is stopped, and any
+     * exception from T's constructor is delivered through the future.
+     */
+    template <class T, class... Args>
+    std::future<std::shared_ptr<T>> submit_shared(
+        Args&&... args
+    );
+
+
+    template <class T, class... Args>
+    std::future<std::shared_ptr<T>> submit_shared_priority(
+        int priority,
+        Args&&... args
+    );
 
 
     // ============================================================
@@ -2876,19 +3163,30 @@ private:
     std::function<void()> reject_callback_;
 
 
+    /*
+     * sequence_ is scheduling order, not diagnostics: it must stay a
+     * real atomic even when metrics are compiled out, otherwise the
+     * priority queue's FIFO tie-breaking would break.
+     */
     std::atomic<std::uint64_t> sequence_{0};
 
-    std::atomic<std::uint64_t> submitted_{0};
 
-    std::atomic<std::uint64_t> completed_{0};
+    /*
+     * Diagnostic counters, compile-time selectable since 5.3.0.
+     * metric_counter's disabled specialization keeps the very same
+     * fetch_add/load interface as std::atomic but does nothing.
+     */
+    threadpool_detail::metric_counter<std::uint64_t> submitted_{0};
 
-    std::atomic<std::uint64_t> cancelled_{0};
+    threadpool_detail::metric_counter<std::uint64_t> completed_{0};
 
-    std::atomic<std::uint64_t> rejected_{0};
+    threadpool_detail::metric_counter<std::uint64_t> cancelled_{0};
 
-    std::atomic<std::uint64_t> running_{0};
+    threadpool_detail::metric_counter<std::uint64_t> rejected_{0};
 
-    std::atomic<std::uint64_t> stolen_{0};
+    threadpool_detail::metric_counter<std::uint64_t> running_{0};
+
+    threadpool_detail::metric_counter<std::uint64_t> stolen_{0};
 
 
     /*
@@ -2896,11 +3194,11 @@ private:
      * before std::packaged_task stores the exception in the future, so a
      * caller that never calls get() still leaves a trace in the metrics.
      */
-    std::atomic<std::uint64_t> failed_{0};
+    threadpool_detail::metric_counter<std::uint64_t> failed_{0};
 
-    std::atomic<std::uint64_t> token_cancelled_{0};
+    threadpool_detail::metric_counter<std::uint64_t> token_cancelled_{0};
 
-    std::atomic<std::uint64_t> timed_out_{0};
+    threadpool_detail::metric_counter<std::uint64_t> timed_out_{0};
 };
 
 
@@ -3164,6 +3462,135 @@ bool ThreadPool::wait_until(
                 local_pending_.load(
                     std::memory_order_relaxed
                 ) == 0;
+        }
+    );
+}
+
+
+// ============================================================
+// submit_discard / submit_shared (5.3.0)
+// ============================================================
+
+template <class F, class... Args>
+std::future<void> ThreadPool::submit_discard(
+    F&& f,
+    Args&&... args
+)
+{
+    return submit_discard_priority(
+        0,
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <class F, class... Args>
+std::future<void> ThreadPool::submit_discard_priority(
+    int priority,
+    F&& f,
+    Args&&... args
+)
+{
+    /*
+     * The wrapper returns void, so std::packaged_task<void()> never
+     * has to store the user's result type. If the result is a
+     * prvalue of a non-movable type, evaluating the discarded
+     * expression is still legal: C++17 materializes it and destroys
+     * it at the end of the full expression, with no extra move.
+     *
+     * The callable itself is invoked through the existing engine, so
+     * token context, metrics and rejection behavior are inherited.
+     */
+    return submit_priority(
+        priority,
+        [
+            callable = std::decay_t<F>(
+                std::forward<F>(f)
+            ),
+            bound = std::tuple<std::decay_t<Args>...>(
+                std::forward<Args>(args)...
+            )
+        ]() mutable
+        {
+            if constexpr(
+                std::is_void_v<
+                    std::invoke_result_t<
+                        std::decay_t<F>&,
+                        std::decay_t<Args>...
+                    >
+                >
+            )
+            {
+                std::apply(
+                    std::move(callable),
+                    std::move(bound)
+                );
+            }
+            else
+            {
+                (void)std::apply(
+                    std::move(callable),
+                    std::move(bound)
+                );
+            }
+        }
+    );
+}
+
+
+template <class T, class... Args>
+std::future<std::shared_ptr<T>> ThreadPool::submit_shared(
+    Args&&... args
+)
+{
+    return submit_shared_priority<T>(
+        0,
+        std::forward<Args>(args)...
+    );
+}
+
+
+template <class T, class... Args>
+std::future<std::shared_ptr<T>> ThreadPool::submit_shared_priority(
+    int priority,
+    Args&&... args
+)
+{
+    /*
+     * Two independent type-erasure steps:
+     *
+     * 1. std::make_shared<T> constructs T in place on the worker
+     *    thread. T itself is never moved or copied, so non-movable
+     *    types work.
+     * 2. The lambda + tuple bind the constructor arguments (which
+     *    may themselves be move-only) and are moved into the task.
+     *
+     * The task's result type is shared_ptr<T>, which future can carry
+     * regardless of T's own properties.
+     */
+    return submit_priority(
+        priority,
+        [
+            bound = std::tuple<std::decay_t<Args>...>(
+                std::forward<Args>(args)...
+            )
+        ]() mutable
+            -> std::shared_ptr<T>
+        {
+            return std::apply(
+                [](
+                    auto&&... ctor_args
+                )
+                {
+                    return std::make_shared<T>(
+                        std::forward<decltype(ctor_args)>(
+                            ctor_args
+                        )...
+                    );
+                },
+                std::move(bound)
+            );
         }
     );
 }

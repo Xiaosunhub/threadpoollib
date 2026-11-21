@@ -1118,6 +1118,7 @@ void ThreadPool::worker_loop(Worker* self)
         }
 
 
+#if THREADPOOL_CFG_ENABLE_WORK_STEALING
         /*
          * 2. Steal from a peer's deque (FIFO end).
          *
@@ -1125,6 +1126,10 @@ void ThreadPool::worker_loop(Worker* self)
          * global queue empty pulls fork-join backlog off a busy peer
          * instead of going to sleep, so long tails do not stall on one
          * thread.
+         *
+         * 5.3.0: compiled out when THREADPOOL_CFG_ENABLE_WORK_STEALING
+         * is 0. The worker then falls straight to sleep instead of
+         * probing every peer's deque.
          */
         if(try_steal(task, self))
         {
@@ -1149,6 +1154,7 @@ void ThreadPool::worker_loop(Worker* self)
 
             continue;
         }
+#endif
 
 
         {
